@@ -84,3 +84,47 @@ def parse(raw: str) -> LogLine:
         message=rest,
         source=source,
     )
+
+
+#: Lines matched verbatim after stripping. The first is the current firmware's
+#: only framing output; the rest are pre-rewrite banner text, kept so devices
+#: that have not been reflashed still display cleanly.
+_NOISE_EXACT = frozenset(
+    {
+        "LOG_EXTRACT_DONE",
+        "========== LOG EXTRACTION START ==========",
+        "========== LOG EXTRACTION END ==========",
+        "No archived logs found, checking ring buffer...",
+        "--- All log files read and deleted, checking ring buffer ---",
+        "--- Next archive ---",
+        "Ring buffer is empty",
+        "Log extraction completed successfully.",
+        "All archived log files have been deleted.",
+        "Ring buffer has been cleared.",
+    }
+)
+
+#: (prefix, suffix) pairs for framing lines with variable content in the middle.
+_NOISE_AFFIXES = (
+    ("Found ", "reading in chronological order"),
+    ("--- Archive ", "---"),
+    ("--- Ring buffer:", "---"),
+)
+
+
+def is_noise(raw: str) -> bool:
+    """Return True if *raw* is extract_logs framing text rather than a log
+    entry.
+
+    Device-emitted warnings and errors are deliberately not treated as noise —
+    they signal a real problem and must stay visible.
+    """
+    stripped = _ANSI_RE.sub("", raw).strip()
+    if not stripped:
+        return True
+    if stripped in _NOISE_EXACT:
+        return True
+    return any(
+        stripped.startswith(prefix) and stripped.endswith(suffix)
+        for prefix, suffix in _NOISE_AFFIXES
+    )

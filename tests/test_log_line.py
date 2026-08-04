@@ -76,3 +76,43 @@ def test_unparseable_line_keeps_its_text_under_a_null_tag():
 def test_strips_trailing_eol():
     line = parse("I/MODEM [2026-07-01T10:11:11.950Z] link up\r\n")
     assert line.message == "link up"
+
+
+from ohme_log_viewer.log_line import is_noise
+
+
+def test_the_completion_sentinel_is_noise():
+    assert is_noise("LOG_EXTRACT_DONE") is True
+    assert is_noise("LOG_EXTRACT_DONE\r\n") is True
+
+
+def test_blank_lines_are_noise():
+    # Firmware emits a bare CRLF to flush a line left dangling by a
+    # chunk-boundary-unaligned read.
+    assert is_noise("") is True
+    assert is_noise("\r\n") is True
+    assert is_noise("   ") is True
+
+
+def test_legacy_banner_lines_are_noise():
+    for banner in (
+        "========== LOG EXTRACTION START ==========",
+        "========== LOG EXTRACTION END ==========",
+        "No archived logs found, checking ring buffer...",
+        "Ring buffer is empty",
+        "Ring buffer has been cleared.",
+        "Found 3 archived log file(s), reading in chronological order",
+        "--- Archive 1/3: log_20260701.txt (512 bytes) ---",
+        "--- Ring buffer: 78 bytes ---",
+    ):
+        assert is_noise(banner) is True, banner
+
+
+def test_real_log_lines_are_not_noise():
+    assert is_noise("I/MODEM [2026-07-01T10:11:11.950Z] link up") is False
+
+
+def test_device_warnings_and_errors_are_not_noise():
+    # These indicate a real problem on the device and must stay visible.
+    assert is_noise("Warning: Could not delete log_20260701.txt") is False
+    assert is_noise("Error reading archive") is False
