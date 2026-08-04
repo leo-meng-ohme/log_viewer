@@ -96,6 +96,31 @@ def test_read_line_returns_none_on_timeout_without_a_complete_line():
     assert link.read_line() is None
 
 
+def test_read_line_gives_up_on_a_stream_that_never_completes_a_line():
+    """A newline-less stream must not block the call or grow the buffer forever.
+
+    port.read() never returns empty here, so only the call's own deadline can
+    end it. Without that, the reader thread would never regain control to check
+    for interruption and Disconnect would hang.
+    """
+
+    class EndlessNoise:
+        in_waiting = 5
+
+        def read(self, _size):
+            return b"noise"
+
+        def write(self, data):
+            return len(data)
+
+        def close(self):
+            pass
+
+    link = SerialLink(read_timeout_s=0.05, serial_factory=lambda **kwargs: EndlessNoise())
+    link.open("/dev/fake")
+    assert link.read_line() is None
+
+
 def test_read_line_keeps_the_partial_line_for_the_next_call():
     fake = FakeSerial([b"par", b""])
     link = link_with(fake)

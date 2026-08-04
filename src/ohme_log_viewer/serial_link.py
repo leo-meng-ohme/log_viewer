@@ -7,6 +7,7 @@ therefore never see half a log line.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import serial
@@ -101,14 +102,24 @@ class SerialLink:
 
         Any bytes read that do not yet form a complete line stay buffered for
         the following call.
+
+        The deadline bounds this call as a whole, not merely each underlying
+        read. A device emitting bytes with no newline among them keeps
+        ``port.read()`` returning data indefinitely, so without the deadline
+        this loop would never hand control back: the caller's thread could not
+        check for interruption and the buffer would grow without limit.
         """
         port = self._require_port()
+        deadline = time.monotonic() + self._read_timeout_s
         while True:
             newline = self._buf.find(b"\n")
             if newline >= 0:
                 raw = bytes(self._buf[:newline])
                 del self._buf[: newline + 1]
                 return raw.decode("utf-8", errors="replace").rstrip("\r")
+
+            if time.monotonic() > deadline:
+                return None  # no complete line within the timeout
 
             try:
                 pending = port.in_waiting or 1
