@@ -1184,9 +1184,11 @@ class LogReader(QThread):
                     return
                 if not self._sleep_interruptibly(CYCLE_DELAY_S):
                     return
-        except SerialLinkError as exc:
-            self.error.emit(str(exc))
-        except OSError as exc:
+        except (SerialLinkError, OSError) as exc:
+            # One clause, not two identical ones. SerialLink converts every
+            # serial/OS failure to SerialLinkError before it reaches here, so
+            # OSError is only reachable via a non-conforming link — worth
+            # catching, not worth a duplicated body.
             self.error.emit(str(exc))
 
     def _sleep_interruptibly(self, seconds: float) -> bool:
