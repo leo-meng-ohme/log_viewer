@@ -46,7 +46,17 @@ class TagPanel(QWidget):
         counts: dict[str, int],
         enabled: dict[str, bool],
     ) -> None:
-        """Add any new tags and refresh every count. Safe to call repeatedly."""
+        """Add any new tags, refresh every count, and mirror *enabled*.
+
+        Safe to call repeatedly — it updates rows in place and never
+        duplicates one. Check state is mirrored from *enabled* on every call,
+        not just when a row is created: the buffer owns filter state and this
+        panel is a projection of it, so mirroring keeps the two from drifting.
+        The caller must therefore pass its authoritative map.
+
+        Emits nothing. Writing check states fires Qt's ``itemChanged``, which
+        is suppressed here — otherwise every flush would re-apply the filter.
+        """
         self._suppress_signals = True
         try:
             for tag in tags:
