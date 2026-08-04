@@ -618,6 +618,8 @@ Expected: 24 passed.
 
 `read_line` returns a complete line with its EOL stripped, or `None` when the read timed out with no complete line available. It never returns a partial line.
 
+The timeout bounds the **call**, not just each underlying `port.read()`. A device streaming bytes with no newline in them — wrong baud rate, binary noise, a garbled boot message — would otherwise keep the loop fed forever: `port.read()` never returns empty, so the call never returns, the reader thread never gets to check for interruption (hanging Disconnect), and the buffer grows without bound. A deadline taken on entry prevents all three.
+
 The injectable `serial_factory` is what makes this testable without hardware — tests pass a fake in place of `serial.Serial`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -723,6 +725,31 @@ def test_read_line_returns_none_on_timeout_without_a_complete_line():
     assert link.read_line() is None
 
 
+def test_read_line_gives_up_on_a_stream_that_never_completes_a_line():
+    """A newline-less stream must not block the call or grow the buffer forever.
+
+    port.read() never returns empty here, so only the call's own deadline can
+    end it. Without that, the reader thread would never regain control to check
+    for interruption and Disconnect would hang.
+    """
+
+    class EndlessNoise:
+        in_waiting = 5
+
+        def read(self, _size):
+            return b"noise"
+
+        def write(self, data):
+            return len(data)
+
+        def close(self):
+            pass
+
+    link = SerialLink(read_timeout_s=0.05, serial_factory=lambda **kwargs: EndlessNoise())
+    link.open("/dev/fake")
+    assert link.read_line() is None
+
+
 def test_read_line_keeps_the_partial_line_for_the_next_call():
     fake = FakeSerial([b"par", b""])
     link = link_with(fake)
@@ -798,6 +825,7 @@ therefore never see half a log line.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import serial
@@ -892,14 +920,24 @@ class SerialLink:
 
         Any bytes read that do not yet form a complete line stay buffered for
         the following call.
+
+        The deadline bounds this call as a whole, not merely each underlying
+        read. A device emitting bytes with no newline among them keeps
+        ``port.read()`` returning data indefinitely, so without the deadline
+        this loop would never hand control back: the caller's thread could not
+        check for interruption and the buffer would grow without limit.
         """
         port = self._require_port()
+        deadline = time.monotonic() + self._read_timeout_s
         while True:
             newline = self._buf.find(b"\n")
             if newline >= 0:
                 raw = bytes(self._buf[:newline])
                 del self._buf[: newline + 1]
                 return raw.decode("utf-8", errors="replace").rstrip("\r")
+
+            if time.monotonic() > deadline:
+                return None  # no complete line within the timeout
 
             try:
                 pending = port.in_waiting or 1
@@ -920,7 +958,7 @@ class SerialLink:
 - [ ] **Step 4: Run the full suite to verify it passes**
 
 Run: `.venv/bin/pytest -v`
-Expected: 38 passed.
+Expected: 39 passed.
 
 ---
 
@@ -1166,7 +1204,7 @@ class LogReader(QThread):
 - [ ] **Step 4: Run the full suite to verify it passes**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 47 passed.
 
 ---
 
@@ -1386,7 +1424,7 @@ Expected: prints `log pane OK`.
 - [ ] **Step 4: Run the full suite to confirm nothing regressed**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 47 passed.
 
 ---
 
@@ -1550,7 +1588,7 @@ Expected: prints `tag panel OK`.
 - [ ] **Step 3: Run the full suite to confirm nothing regressed**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 47 passed.
 
 ---
 
@@ -1910,7 +1948,7 @@ Expected: a window titled "Ohme Log Viewer" with a port dropdown, Refresh, Conne
 - [ ] **Step 5: Run the full suite**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 47 passed.
 
 ---
 
@@ -2004,4 +2042,4 @@ Record any of the 13 that fail. Fix them before calling the work done.
 - [ ] **Step 3: Final full-suite run**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 47 passed.
