@@ -45,10 +45,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Ohme Log Viewer")
         self.resize(1100, 700)
 
-        self._link = SerialLink()
+        # One link per connection, created in _connect. Never a long-lived
+        # instance shared between sessions: a reader that outlives its session
+        # would otherwise be holding the very object the next session opens.
+        self._link: SerialLink | None = None
         self._buffer = LogBuffer()
         self._reader: LogReader | None = None
         self._pending: list[LogLine] = []
+        self._rerender_pending = False
         self._received = 0
         self._last_error: str | None = None
         # Readers that would not stop. Held so neither Qt nor Python frees a
@@ -140,15 +144,21 @@ class MainWindow(QMainWindow):
             self._report_error("No serial port selected")
             return
 
+        # A fresh link per connection. If a previous reader had to be parked it
+        # still holds the *previous* link, which _disconnect closed, so it can
+        # neither read this session's port nor write its own extract_logs to
+        # it — and it cannot race this session on a shared receive buffer.
+        link = SerialLink()
         try:
-            self._link.open(device)
+            link.open(device)
         except SerialLinkError as exc:
             self._report_error(f"Could not open {device}: {exc}")
             return
 
+        self._link = link
         self._last_error = None
 
-        self._reader = LogReader(self._link)
+        self._reader = LogReader(link)
         self._reader.line_received.connect(self._on_line_received)
         self._reader.error.connect(self._on_reader_error)
         self._reader.finished.connect(self._on_reader_finished)
@@ -171,12 +181,25 @@ class MainWindow(QMainWindow):
                 # carry on: leaking one stuck thread beats killing the app. The
                 # reader's own reads and sleeps are bounded, so reaching this
                 # means something pathological — say so rather than hiding it.
+                #
+                # Cut its signals first. A parked reader is still running and
+                # will emit whenever it unblocks; left connected it would push
+                # lines into the buffer, or trigger a second _disconnect, long
+                # after the UI said "Disconnected". Parked means inert.
+                reader.line_received.disconnect(self._on_line_received)
+                reader.error.disconnect(self._on_reader_error)
+                reader.finished.disconnect(self._on_reader_finished)
                 self._orphaned_readers.append(reader)
                 self._report_error(
                     f"Reader thread did not stop within "
                     f"{_READER_STOP_TIMEOUT_MS // 1000}s; leaving it parked"
                 )
-        self._link.close()
+
+        # Closed even for a parked reader: the link drops its port reference,
+        # so the orphan's next call raises instead of touching the device.
+        link, self._link = self._link, None
+        if link is not None:
+            link.close()
 
         self._connect_btn.setText("Connect")
         self._port_combo.setEnabled(True)
@@ -215,7 +238,13 @@ class MainWindow(QMainWindow):
             self._pending.append(line)
 
     def _flush(self) -> None:
-        if self._pending:
+        if self._rerender_pending:
+            # A filter change invalidates the whole view, so the incremental
+            # batch is dropped rather than appended on top of the re-render.
+            self._pending.clear()
+            self._pane.render(self._buffer.visible())
+            self._rerender_pending = False
+        elif self._pending:
             self._pane.append_lines(self._pending)
             self._pending.clear()
         self._sync_tags()
@@ -230,17 +259,23 @@ class MainWindow(QMainWindow):
         )
 
     def _on_tag_toggled(self, tag: str, on: bool) -> None:
+        """Record a filter change and let the next flush repaint once.
+
+        Re-enabling a tag must bring its earlier lines back, which costs a
+        full re-render of the buffer. Doing that inline made All/None — which
+        emit one signal per tag — cost tags × lines: measured at 3.9 s frozen
+        for None and 4.3 s for All over a full 50,000-line buffer with 30
+        tags. Deferring to the 100 ms flush collapses any number of toggles
+        into a single render. A lone toggle repaints up to 100 ms later, which
+        is exactly how arriving lines already behave.
+        """
         self._buffer.set_tag_enabled(tag, on)
-        # Full re-render, so re-enabling a tag brings its earlier lines back.
-        # The pending batch is dropped first, otherwise those lines would be
-        # appended a second time after already being rendered here.
-        self._pending.clear()
-        self._pane.render(self._buffer.visible())
-        self._update_status()
+        self._rerender_pending = True
 
     def _on_clear_clicked(self) -> None:
         self._buffer.clear()
         self._pending.clear()
+        self._rerender_pending = False
         self._pane.clear()
         self._received = 0
         # Tags and their check states deliberately survive a clear.

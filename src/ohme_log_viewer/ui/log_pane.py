@@ -9,7 +9,7 @@ view's memory would grow without bound on a long session.
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QPlainTextEdit, QVBoxLayout, QWidget
@@ -35,8 +35,15 @@ _LEVEL_COLOURS = {
 _UNPARSED_COLOUR = "#9cdcfe"
 _ERROR_COLOUR = "#f14c4c"
 
-#: Scroll position tolerance, in pixels, for "the user is at the bottom".
-_AT_BOTTOM_SLACK = 4
+#: Scroll position tolerance, in LINES, for "the user is at the bottom".
+#:
+#: The unit matters. Unlike QTextEdit, QPlainTextEdit's vertical scrollbar is
+#: measured in blocks — one step is one line, not one pixel. Any non-zero slack
+#: is therefore a dead zone several lines deep, and a default mouse-wheel notch
+#: is only three lines: the commonest way of scrolling up to read something
+#: would land inside it and the next append would yank the view back down.
+#: Zero means "exactly at the end", which is what following the tail means.
+_AT_BOTTOM_SLACK = 0
 
 
 class LogPane(QWidget):
