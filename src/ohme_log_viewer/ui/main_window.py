@@ -36,6 +36,7 @@ from ..log_buffer import MAX_LINES, LogBuffer
 from ..log_line import LogLine, is_noise, parse
 from ..reader import LogReader
 from ..serial_link import SerialLink, SerialLinkError, list_usb_ports
+from ..version import __version__
 from .log_pane import LogPane
 from .tag_panel import TagPanel
 
@@ -66,7 +67,7 @@ class MainWindow(QMainWindow):
         retry_interval_ms: int = _RETRY_INTERVAL_MS,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("Ohme Log Viewer")
+        self.setWindowTitle(f"Ohme Log Viewer v{__version__}")
         self.resize(1100, 700)
 
         # Both are per-connection, so they are factories rather than instances:
