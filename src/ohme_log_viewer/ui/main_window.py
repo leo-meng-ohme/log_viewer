@@ -33,6 +33,9 @@ from .tag_panel import TagPanel
 #: Display batching interval. A burst of lines costs one repaint, not one each.
 _FLUSH_INTERVAL_MS = 100
 
+#: How long to wait for the reader thread to exit before giving up on it.
+_READER_STOP_TIMEOUT_MS = 5000
+
 
 class MainWindow(QMainWindow):
     """Top-level window."""
@@ -48,6 +51,9 @@ class MainWindow(QMainWindow):
         self._pending: list[LogLine] = []
         self._received = 0
         self._last_error: str | None = None
+        # Readers that would not stop. Held so neither Qt nor Python frees a
+        # thread object while its OS thread is still running.
+        self._orphaned_readers: list[LogReader] = []
 
         self._build_ui()
         self._refresh_ports()
@@ -129,7 +135,9 @@ class MainWindow(QMainWindow):
     def _connect(self) -> None:
         device = self._port_combo.currentData()
         if device is None:
-            self.statusBar().showMessage("No serial port selected")
+            # Via _report_error, not showMessage: the flush timer rewrites the
+            # status text every 100 ms and would erase it before it was read.
+            self._report_error("No serial port selected")
             return
 
         try:
@@ -155,8 +163,19 @@ class MainWindow(QMainWindow):
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.stop()
-            reader.wait(5000)
-            reader.deleteLater()
+            if reader.wait(_READER_STOP_TIMEOUT_MS):
+                reader.deleteLater()
+            else:
+                # Destroying a QThread Qt still considers running is fatal, and
+                # letting Python collect the wrapper is no better. Park it and
+                # carry on: leaking one stuck thread beats killing the app. The
+                # reader's own reads and sleeps are bounded, so reaching this
+                # means something pathological — say so rather than hiding it.
+                self._orphaned_readers.append(reader)
+                self._report_error(
+                    f"Reader thread did not stop within "
+                    f"{_READER_STOP_TIMEOUT_MS // 1000}s; leaving it parked"
+                )
         self._link.close()
 
         self._connect_btn.setText("Connect")
