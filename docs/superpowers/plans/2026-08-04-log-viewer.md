@@ -1674,6 +1674,9 @@ from .tag_panel import TagPanel
 #: Display batching interval. A burst of lines costs one repaint, not one each.
 _FLUSH_INTERVAL_MS = 100
 
+#: How long to wait for the reader thread to exit before giving up on it.
+_READER_STOP_TIMEOUT_MS = 5000
+
 
 class MainWindow(QMainWindow):
     """Top-level window."""
@@ -1689,6 +1692,9 @@ class MainWindow(QMainWindow):
         self._pending: list[LogLine] = []
         self._received = 0
         self._last_error: str | None = None
+        # Readers that would not stop. Held so neither Qt nor Python frees a
+        # thread object while its OS thread is still running.
+        self._orphaned_readers: list[LogReader] = []
 
         self._build_ui()
         self._refresh_ports()
@@ -1770,7 +1776,9 @@ class MainWindow(QMainWindow):
     def _connect(self) -> None:
         device = self._port_combo.currentData()
         if device is None:
-            self.statusBar().showMessage("No serial port selected")
+            # Via _report_error, not showMessage: the flush timer rewrites the
+            # status text every 100 ms and would erase it before it was read.
+            self._report_error("No serial port selected")
             return
 
         try:
@@ -1796,8 +1804,19 @@ class MainWindow(QMainWindow):
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.stop()
-            reader.wait(5000)
-            reader.deleteLater()
+            if reader.wait(_READER_STOP_TIMEOUT_MS):
+                reader.deleteLater()
+            else:
+                # Destroying a QThread Qt still considers running is fatal, and
+                # letting Python collect the wrapper is no better. Park it and
+                # carry on: leaking one stuck thread beats killing the app. The
+                # reader's own reads and sleeps are bounded, so reaching this
+                # means something pathological — say so rather than hiding it.
+                self._orphaned_readers.append(reader)
+                self._report_error(
+                    f"Reader thread did not stop within "
+                    f"{_READER_STOP_TIMEOUT_MS // 1000}s; leaving it parked"
+                )
         self._link.close()
 
         self._connect_btn.setText("Connect")
@@ -1968,6 +1987,16 @@ window._report_error('device disconnected')
 window._flush()
 assert 'last error: device disconnected' in window.statusBar().currentMessage()
 
+# Connecting with no port selected must report through the same durable path,
+# not a showMessage that the next flush erases. The combo is emptied first so
+# this holds on a machine that does enumerate serial ports — otherwise the
+# check would try to open a real device instead of taking the no-port branch.
+window._port_combo.clear()
+window._on_connect_clicked()
+window._flush()
+assert window._reader is None, 'no-port path must not start a reader'
+assert 'No serial port selected' in window.statusBar().currentMessage()
+
 window._on_clear_clicked()
 assert window._received == 0
 assert window._pane.line_count() == 0, window._pane.line_count()
@@ -2028,6 +2057,17 @@ python3 -m venv .venv
 
 Pick the device's USB serial port from the dropdown and press **Connect**.
 
+## ⚠️ Connecting consumes the device's logs
+
+This viewer streams by sending `extract_logs`, and that command is **destructive
+on the device**: the firmware deletes its archived log files and clears its ring
+buffer once it has read them out. The logs move to your screen rather than being
+copied to it.
+
+So if you need to preserve a device's logs — a field return, a fault you have not
+finished diagnosing, anything you might want a second look at — capture them
+another way first. Connecting is not a read-only operation.
+
 ## What it does
 
 - **Port selection** — every serial port on the machine, USB devices annotated
@@ -2059,9 +2099,16 @@ and need no hardware. The Qt widgets are checked by the headless scripts in the
 implementation plan and by the on-device smoke test.
 ```
 
-- [ ] **Step 2: Smoke test against a device**
+- [ ] **Step 2: Hand the smoke test to the repository owner**
 
-Plug in a Home Pro V2 over USB, then run `.venv/bin/ohme-log-viewer` and confirm each of these:
+**This step is not run by the implementer.** `extract_logs` deletes the device's
+archived logs and clears its ring buffer, so running it decides on the owner's
+behalf that a particular charger's logs are expendable. That is theirs to
+decide, not ours. Write the checklist below into the report as a handover and
+stop there.
+
+The owner runs `.venv/bin/ohme-log-viewer` with a Home Pro V2 plugged in — one
+whose logs they are content to clear — and confirms each of these:
 
 1. The device's port appears in the dropdown with a VID:PID annotation.
 2. **Connect** starts lines flowing within a couple of seconds, and the button becomes **Disconnect**.
@@ -2077,7 +2124,9 @@ Plug in a Home Pro V2 over USB, then run `.venv/bin/ohme-log-viewer` and confirm
 12. Unplugging the USB cable mid-stream shows a red `[error]` line and a status-bar message, returns the UI to disconnected, and leaves the already-captured lines readable and filterable.
 13. Closing the window exits cleanly with no `QThread: Destroyed while thread is still running` message on the console.
 
-Record any of the 13 that fail. Fix them before calling the work done.
+Any of the 13 that fail become findings. Until the owner has run it, the branch
+is complete only up to what can be verified without hardware — say so plainly
+rather than implying the app is proven end to end.
 
 - [ ] **Step 3: Final full-suite run**
 
