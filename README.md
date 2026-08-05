@@ -74,6 +74,18 @@ with that reason in the status bar rather than a silent stall.
 - **Continuous streaming** — on Connect it sends `extract_logs`, reads until the
   device's `LOG_EXTRACT_DONE` sentinel, waits one second, and repeats until you
   disconnect. There is no one-shot mode.
+- **Connect keeps trying** — if the port is not there yet, Connect retries every
+  second until it is, so you can press it before plugging the device in. A
+  session that drops — a reboot, a DFU, an unplugged cable — goes back to
+  retrying and picks the stream up again on its own; the lines captured before
+  the drop stay in view. **Disconnect** stops it, whether it is streaming or
+  retrying. A failure that repeats is reported once, with the live state and
+  attempt count in the status bar.
+  <br>One exception: a *refused* authentication stops rather than retries —
+  wrong credentials or an unprovisioned unit will not start working a second
+  later, and retrying would mean a backend round trip every second for as long
+  as the window is open. Handshake timeouts and backend network errors are
+  treated as transient and do retry.
 - **Tag filter** — tags appear in the left panel as soon as a line carrying one
   arrives, checked by default, with a running count each. Unchecking hides that
   tag's lines; re-checking brings them back, including lines that arrived while

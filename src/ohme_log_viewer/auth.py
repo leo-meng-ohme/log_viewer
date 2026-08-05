@@ -90,7 +90,20 @@ class AuthError(Exception):
 
     Deliberately not a :class:`~ohme_log_viewer.serial_link.SerialLinkError`:
     the link is fine, and the message that reaches the user should say so.
+
+    ``retryable`` separates a transient from a refusal, because the viewer
+    retries a failed session once a second and the two must not be treated
+    alike. A device that did not answer in time, or a backend that could not be
+    reached, will very likely work on the next attempt — a device rebooting
+    mid-handshake is exactly that case. A refusal — wrong credentials, a
+    rejected JWT, an unprovisioned unit — will not, and retrying it would mean
+    one pointless backend round trip per second for as long as the window is
+    open.
     """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 # ── protocol ─────────────────────────────────────────────────────────────
@@ -217,6 +230,15 @@ class _HttpFailure(Exception):
             return f"network error — {self.body}"
         return f"HTTP {self.status} — {self.body}"
 
+    @property
+    def transient(self) -> bool:
+        """True if trying again shortly could plausibly succeed.
+
+        An unreachable host and a 5xx are worth another attempt; a 4xx is the
+        server telling us the request itself is wrong.
+        """
+        return self.status is None or self.status >= 500
+
 
 def _firebase_key_for(be_url: str) -> str:
     host = urlparse(be_url).hostname or ""
@@ -263,14 +285,20 @@ class BackendSigner:
             response = self._post(url, payload, self._auth_header())
         except _HttpFailure as failure:
             if failure.status != 401:
-                raise AuthError(f"Backend would not sign the challenge: {failure.describe()}")
+                raise AuthError(
+                    f"Backend would not sign the challenge: {failure.describe()}",
+                    retryable=failure.transient,
+                )
             # The token was accepted when it was fetched and is not now. One
             # forced refresh distinguishes a lapsed token from a real refusal.
             self._expiry = 0.0
             try:
                 response = self._post(url, payload, self._auth_header())
             except _HttpFailure as retry:
-                raise AuthError(f"Backend would not sign the challenge: {retry.describe()}")
+                raise AuthError(
+                    f"Backend would not sign the challenge: {retry.describe()}",
+                    retryable=retry.transient,
+                )
 
         signature = response.get("signature")
         if not signature:
@@ -339,7 +367,8 @@ class BackendSigner:
             )
         except _HttpFailure as failure:
             raise AuthError(
-                f"Firebase sign-in as {self._credentials.email} failed: {failure.describe()}"
+                f"Firebase sign-in as {self._credentials.email} failed: {failure.describe()}",
+                retryable=failure.transient,
             )
 
         id_token = str(response.get("idToken", ""))
@@ -504,7 +533,10 @@ class DeviceAuthenticator:
                 return None
             if self._now() > deadline:
                 raise AuthError(
-                    f"Device did not answer '{command}': timed out after {timeout_s:.0f}s"
+                    f"Device did not answer '{command}': timed out after {timeout_s:.0f}s",
+                    # A device mid-reboot answers nothing and is fine a moment
+                    # later, which is the case the viewer's retry exists for.
+                    retryable=True,
                 )
             line = link.read_line()
             if line is None:

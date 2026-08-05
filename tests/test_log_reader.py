@@ -77,6 +77,7 @@ class Collector(QObject):
         super().__init__()
         self.lines: list[str] = []
         self.errors: list[str] = []
+        self.auth_failures: list[str] = []
         self.finished = False
 
     def on_line(self, text: str) -> None:
@@ -84,6 +85,9 @@ class Collector(QObject):
 
     def on_error(self, message: str) -> None:
         self.errors.append(message)
+
+    def on_auth_failed(self, message: str) -> None:
+        self.auth_failures.append(message)
 
     def on_finished(self) -> None:
         self.finished = True
@@ -196,22 +200,47 @@ def test_a_challenge_from_the_device_reaches_the_authenticator(qapp):
     assert AUTH_REQUIRED not in collector.lines
 
 
-def test_an_authentication_failure_reaches_the_error_signal(qapp):
+def failing_reader(exc):
+    """A reader whose first challenge raises *exc* out of the authenticator."""
+
     class RefusingAuthenticator:
         def authenticate(self, link, challenge, emit, should_stop):
-            raise AuthError("backend would not sign the challenge")
+            raise exc
 
-    reader = LogReader(FakeLink([AUTH_REQUIRED]), authenticator=RefusingAuthenticator())
+    return LogReader(FakeLink([AUTH_REQUIRED]), authenticator=RefusingAuthenticator())
+
+
+def test_a_refused_authentication_reaches_the_auth_failed_signal(qapp):
+    # Refusals travel separately from ordinary failures so the window can stop
+    # retrying: no amount of waiting fixes a rejected credential.
+    reader = failing_reader(AuthError("backend would not sign the challenge"))
     collector = Collector()
     reader.error.connect(collector.on_error)
+    reader.auth_failed.connect(collector.on_auth_failed)
     reader.finished.connect(collector.on_finished)
 
     with running(reader):
-        assert pump_until(qapp, lambda: collector.errors != []), "no error emitted"
+        assert pump_until(qapp, lambda: collector.auth_failures != []), "no refusal emitted"
         assert pump_until(qapp, lambda: collector.finished), "thread did not finish"
 
-    assert collector.errors == ["backend would not sign the challenge"]
+    assert collector.auth_failures == ["backend would not sign the challenge"]
+    assert collector.errors == []
     assert not reader.isRunning()
+
+
+def test_a_transient_authentication_failure_reaches_the_error_signal(qapp):
+    # A device that did not answer in time is worth another attempt, so it
+    # travels the same channel as a link failure.
+    reader = failing_reader(AuthError("device did not answer in time", retryable=True))
+    collector = Collector()
+    reader.error.connect(collector.on_error)
+    reader.auth_failed.connect(collector.on_auth_failed)
+
+    with running(reader):
+        assert pump_until(qapp, lambda: collector.errors != []), "no error emitted"
+
+    assert collector.errors == ["device did not answer in time"]
+    assert collector.auth_failures == []
 
 
 def test_no_lines_are_emitted_after_the_signal_is_disconnected(qapp):
