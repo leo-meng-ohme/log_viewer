@@ -56,9 +56,13 @@ red, warn amber, info plain, debug and verbose dimmed.
 
 ```bash
 .venv/bin/pytest
+.venv/bin/ruff check src/ tests/
+.venv/bin/black --check src/ tests/
 ```
 
 The parser (`log_line.py`), buffer (`log_buffer.py`), transport
 (`serial_link.py`) and extraction loop (`reader.py`) are covered by unit tests
-and need no hardware. The Qt widgets are checked by the headless scripts in the
-implementation plan and by the on-device smoke test.
+and need no hardware. Nor does the reader's `QThread`: `tests/test_log_reader.py`
+drives the real thread and its real signal connections against a fake link, with
+Qt on its offscreen platform. The widgets themselves are checked by the headless
+scripts in the implementation plan and by the on-device smoke test.
