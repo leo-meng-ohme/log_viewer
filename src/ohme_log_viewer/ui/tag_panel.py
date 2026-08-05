@@ -54,6 +54,11 @@ class TagPanel(QWidget):
 
     tag_toggled: Signal = Signal(str, bool)
 
+    #: The user asked for the list to be rebuilt. Emitted rather than acted on:
+    #: which tags exist is the buffer's to say, and this panel is its
+    #: projection.
+    tags_refresh_requested: Signal = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._items: dict[str, QListWidgetItem] = {}
@@ -97,6 +102,21 @@ class TagPanel(QWidget):
                     Qt.CheckState.Checked if enabled.get(tag, True) else Qt.CheckState.Unchecked
                 )
                 item.setText(f"{tag}  ({counts.get(tag, 0)})")
+        finally:
+            self._suppress_signals = False
+
+    def reset(self) -> None:
+        """Drop every row, leaving the next :meth:`sync` to rebuild the list.
+
+        Rows are destroyed rather than unticked, so no ``tag_toggled`` is
+        emitted and the filter is left entirely to the caller — which has just
+        rebuilt it and will pass the new state on the following sync.
+        """
+        self._suppress_signals = True
+        try:
+            # Both together: _items would otherwise hold rows Qt has deleted.
+            self._list.clear()
+            self._items.clear()
         finally:
             self._suppress_signals = False
 
@@ -169,6 +189,15 @@ class TagPanel(QWidget):
         none_btn.clicked.connect(lambda: self.set_all(False))
         buttons.addWidget(none_btn)
         layout.addLayout(buttons)
+
+        # Its own row: three buttons across 200 px would elide their own labels.
+        self._refresh_tags_btn = QPushButton("Refresh tags")
+        self._refresh_tags_btn.setToolTip(
+            "Rebuild the list from the lines currently held, dropping tags that "
+            "no longer appear in them. Every remaining tag comes back ticked."
+        )
+        self._refresh_tags_btn.clicked.connect(self.tags_refresh_requested.emit)
+        layout.addWidget(self._refresh_tags_btn)
 
     def _on_item_changed(self, item: QListWidgetItem) -> None:
         if self._suppress_signals or self._propagating:

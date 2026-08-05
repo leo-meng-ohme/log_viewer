@@ -69,8 +69,12 @@ with that reason in the status bar rather than a silent stall.
 
 ## What it does
 
-- **Port selection** — every serial port on the machine, USB devices annotated
-  with their VID:PID. **Refresh** re-enumerates.
+- **Port selection** — the machine's USB serial ports, annotated with their
+  VID:PID. **Refresh** re-enumerates. Only USB devices are listed: macOS also
+  reports virtual ports that are not devices at all — the debug console,
+  wlan-debug, Bluetooth, any paired headset — and pyserial knows nothing about
+  them, so they used to fill the dropdown with identical `n/a` rows. A device the
+  platform declines to describe is still listed, named by its path.
 - **Continuous streaming** — on Connect it sends `extract_logs`, reads until the
   device's `LOG_EXTRACT_DONE` sentinel, waits one second, and repeats until you
   disconnect. There is no one-shot mode.
@@ -103,6 +107,12 @@ with that reason in the status bar rather than a silent stall.
 - **Clear** — empties the view and the buffer but keeps your tag list and
   check states, so clearing before a test run does not cost you the filter
   setup.
+- **Refresh tags** — rebuilds the tag list from the lines currently held. Tags
+  otherwise accumulate for the life of the window, so after a Clear, or a device
+  reflashed with different modules, the panel keeps listing tags that no longer
+  appear. This drops those, recounts the rest against the stored lines, and
+  brings every remaining tag back ticked — so it clears your filter as well as
+  the stale entries.
 
 The last 50,000 lines are held in memory. Levels are coloured: assert and error
 red, warn amber, info plain, debug and verbose dimmed.

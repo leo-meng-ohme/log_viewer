@@ -35,14 +35,31 @@ class PortInfo:
     label: str
 
 
-def list_usb_ports() -> list[PortInfo]:
-    """Enumerate serial ports, annotating USB devices with their VID:PID."""
+#: pyserial's placeholder when the platform tells it nothing about a port. Not
+#: a name, and useless in a dropdown.
+_NO_DESCRIPTION = "n/a"
+
+
+def list_usb_ports(comports=list_ports.comports) -> list[PortInfo]:
+    """Enumerate USB serial ports, annotated with their VID:PID.
+
+    Only USB devices, as the name says. macOS reports several virtual ports that
+    are not devices at all — the debug console, wlan-debug, Bluetooth, any
+    paired headset — and pyserial has no VID/PID or description for any of them,
+    so they arrive as a row of identical ``n/a`` entries that bury the one port
+    worth picking. A USB CDC device always reports both halves of its ID, so
+    requiring them is what separates a device from a platform artefact.
+    """
     found: list[PortInfo] = []
-    for port in list_ports.comports():
-        label = port.description or port.device
-        if port.vid is not None and port.pid is not None:
-            label = f"{label} ({port.vid:04X}:{port.pid:04X})"
-        found.append(PortInfo(device=port.device, label=label))
+    for port in comports():
+        if port.vid is None or port.pid is None:
+            continue
+        # A device the platform declined to describe is still a device: name it
+        # by its path rather than showing pyserial's placeholder.
+        name = port.description
+        if not name or name == _NO_DESCRIPTION:
+            name = port.device
+        found.append(PortInfo(device=port.device, label=f"{name} ({port.vid:04X}:{port.pid:04X})"))
     return found
 
 

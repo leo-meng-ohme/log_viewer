@@ -1,6 +1,25 @@
 import pytest
 
-from ohme_log_viewer.serial_link import SerialLink, SerialLinkError
+from ohme_log_viewer.serial_link import SerialLink, SerialLinkError, list_usb_ports
+
+
+class FakePort:
+    """Stands in for pyserial's ListPortInfo.
+
+    ``description`` and ``hwid`` are ``"n/a"`` rather than None when the platform
+    tells pyserial nothing, which is what macOS does for its built-in virtual
+    ports — hence that string appearing where a name should be.
+    """
+
+    def __init__(self, device, description="n/a", vid=None, pid=None):
+        self.device = device
+        self.description = description
+        self.vid = vid
+        self.pid = pid
+
+
+def listed(*ports):
+    return list_usb_ports(comports=lambda: list(ports))
 
 
 class FakeSerial:
@@ -175,3 +194,46 @@ def test_reopening_discards_the_previous_partial_buffer():
     link._serial_factory = lambda **kwargs: second
     link.open("/dev/fake")
     assert link.read_line() == "clean"
+
+
+# ── port listing ─────────────────────────────────────────────────────────
+#
+# macOS reports a handful of virtual serial ports that are not devices at all —
+# the debug console, wlan-debug, Bluetooth, a paired headset. pyserial gives
+# them no VID/PID and calls them "n/a", so unfiltered they fill the dropdown
+# with identical useless rows.
+
+
+def test_a_usb_device_is_listed_with_its_vid_pid():
+    ports = listed(FakePort("/dev/cu.usbmodem1234", "Ohme Home Pro V2", 0x1FC9, 0x0094))
+    assert [(p.device, p.label) for p in ports] == [
+        ("/dev/cu.usbmodem1234", "Ohme Home Pro V2 (1FC9:0094)")
+    ]
+
+
+def test_a_port_with_no_usb_id_is_left_out():
+    ports = listed(
+        FakePort("/dev/cu.debug-console"),
+        FakePort("/dev/cu.Bluetooth-Incoming-Port"),
+        FakePort("/dev/cu.JabraEvolve265"),
+        FakePort("/dev/cu.usbmodem1234", "Ohme Home Pro V2", 0x1FC9, 0x0094),
+    )
+    assert [p.device for p in ports] == ["/dev/cu.usbmodem1234"]
+
+
+def test_a_port_with_half_a_usb_id_is_left_out():
+    # Neither half alone identifies a device, and the label could not be built.
+    assert listed(FakePort("/dev/cu.odd", "something", 0x1FC9, None)) == []
+    assert listed(FakePort("/dev/cu.odd", "something", None, 0x0094)) == []
+
+
+def test_a_usb_device_with_no_description_is_named_by_its_device_path():
+    # A real device whose description the platform withheld must still be
+    # pickable, and must never be labelled "n/a".
+    ports = listed(FakePort("/dev/cu.usbmodem1234", "n/a", 0x1FC9, 0x0094))
+    assert ports[0].label == "/dev/cu.usbmodem1234 (1FC9:0094)"
+
+
+def test_an_empty_description_is_also_replaced_by_the_device_path():
+    ports = listed(FakePort("/dev/cu.usbmodem1234", "", 0x1FC9, 0x0094))
+    assert ports[0].label == "/dev/cu.usbmodem1234 (1FC9:0094)"

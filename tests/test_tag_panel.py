@@ -275,3 +275,35 @@ def test_the_selection_survives_a_sync_flush(panel):
     select(panel, "MODEM", "OCPP")
     widget.sync(TAGS, {tag: 99 for tag in TAGS}, {tag: True for tag in TAGS})
     assert selected_tags(panel) == {"MODEM", "OCPP"}
+
+
+# ── refreshing the list ──────────────────────────────────────────────────
+
+
+def test_the_refresh_button_asks_the_window_for_a_refresh(panel):
+    widget, _ = panel
+    asked = []
+    widget.tags_refresh_requested.connect(lambda: asked.append(True))
+    widget._refresh_tags_btn.click()
+    assert asked == [True]
+
+
+def test_reset_empties_the_list(panel):
+    widget, _ = panel
+    widget.reset()
+    assert widget._list.count() == 0
+    assert widget._items == {}
+
+
+def test_reset_emits_no_toggles(panel):
+    # Rows are destroyed, not unticked: the filter must not be touched.
+    widget, emitted = panel
+    widget.reset()
+    assert emitted == []
+
+
+def test_the_list_rebuilds_after_a_reset(panel):
+    widget, _ = panel
+    widget.reset()
+    widget.sync(["RCD", "MODEM"], {"RCD": 1, "MODEM": 1}, {"RCD": True, "MODEM": True})
+    assert rows(panel) == ["MODEM", "RCD"]

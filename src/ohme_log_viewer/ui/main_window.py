@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
 
         self._tag_panel = TagPanel()
         self._tag_panel.tag_toggled.connect(self._on_tag_toggled)
+        self._tag_panel.tags_refresh_requested.connect(self._on_tags_refresh_requested)
 
         # Same cap for both, so the view and the buffer never disagree about
         # which lines still exist.
@@ -372,6 +373,19 @@ class MainWindow(QMainWindow):
         """
         self._buffer.set_tag_enabled(tag, on)
         self._rerender_pending = True
+
+    def _on_tags_refresh_requested(self) -> None:
+        """Rebuild the tag list from the lines currently held.
+
+        The buffer rediscovers its tags, the panel drops its rows so the next
+        flush rebuilds them, and the pane is re-rendered because every tag comes
+        back enabled — lines hidden by the old filter have to reappear.
+        """
+        self._buffer.refresh_tags()
+        self._tag_panel.reset()
+        self._rerender_pending = True
+        self._sync_tags()
+        self._update_status()
 
     def _on_clear_clicked(self) -> None:
         self._buffer.clear()

@@ -38,13 +38,36 @@ class LogBuffer:
     def append(self, line: LogLine) -> bool:
         """Store *line*. Returns True if it passes the current filter."""
         key = self.key_for(line)
+        self._count(key)
+        self._lines.append(line)
+        return self._enabled[key]
+
+    def _count(self, key: str) -> None:
+        """Record one line against *key*, discovering the tag if it is new."""
         if key not in self._enabled:
             self._tags.append(key)
             self._enabled[key] = True
             self._counts[key] = 0
         self._counts[key] += 1
-        self._lines.append(line)
-        return self._enabled[key]
+
+    def refresh_tags(self) -> None:
+        """Forget every tag and rediscover them from the lines still stored.
+
+        Tags accumulate for the life of the window: they survive a clear on
+        purpose, and a device reflashed with different modules, or a session
+        that has moved on, leaves entries behind that no longer describe
+        anything. This drops the lot and rebuilds from what is actually in the
+        buffer, so counts describe stored lines rather than everything ever
+        received, and every surviving tag comes back enabled.
+
+        Filter state is deliberately not preserved — a rebuilt list starts
+        showing everything.
+        """
+        self._tags.clear()
+        self._enabled.clear()
+        self._counts.clear()
+        for stored in self._lines:
+            self._count(self.key_for(stored))
 
     def clear(self) -> None:
         """Drop every stored line, keeping discovered tags and their flags.

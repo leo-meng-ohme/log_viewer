@@ -348,3 +348,43 @@ def test_each_session_gets_its_own_authenticator(qapp):
 
     assert len(built) == 2
     assert built[0] is not built[1]
+
+
+# ── refreshing the tag list ──────────────────────────────────────────────
+
+
+def test_refreshing_tags_after_a_clear_empties_the_tag_list(qapp):
+    window = connected(qapp, FakeLink(["I/MODEM [t] hello", MARKER]), StubAuthenticator())
+    try:
+        panel = window._tag_panel
+        assert pump_until(qapp, lambda: "MODEM" in panel._items), sorted(panel._items)
+
+        window._on_clear_clicked()  # keeps tags by design
+        assert "MODEM" in panel._items
+
+        panel._refresh_tags_btn.click()
+        assert pump_until(qapp, lambda: panel._items == {}), sorted(panel._items)
+        assert window._buffer.tags() == []
+    finally:
+        window.close()
+
+
+def test_refreshing_tags_brings_hidden_lines_back(qapp):
+    lines = ["I/MODEM [t] modem line", "I/RCD   [t] rcd line", MARKER]
+    window = connected(qapp, FakeLink(lines), StubAuthenticator())
+    try:
+        panel = window._tag_panel
+        assert pump_until(qapp, lambda: {"MODEM", "RCD"} <= set(panel._items)), sorted(panel._items)
+
+        panel._items["MODEM"].setCheckState(Qt.CheckState.Unchecked)
+        assert pump_until(qapp, lambda: len(raw_lines(window)) == 1), raw_lines(window)
+
+        panel._refresh_tags_btn.click()
+        assert pump_until(qapp, lambda: len(raw_lines(window)) == 2), raw_lines(window)
+        assert pump_until(
+            qapp,
+            lambda: panel._items.get("MODEM") is not None
+            and panel._items["MODEM"].checkState() == Qt.CheckState.Checked,
+        ), "MODEM did not come back ticked"
+    finally:
+        window.close()
