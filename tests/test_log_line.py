@@ -116,3 +116,49 @@ def test_device_warnings_and_errors_are_not_noise():
     # These indicate a real problem on the device and must stay visible.
     assert is_noise("Warning: Could not delete log_20260701.txt") is False
     assert is_noise("Error reading archive") is False
+
+
+# ── chunk padding ────────────────────────────────────────────────────────
+#
+# The CLI framework transmits its whole 512-byte TX buffer for every chunk of a
+# continued command, so each extract_logs chunk arrives padded with NULs. They
+# carry no text and have no glyph, and there is no newline among them to make
+# them a line of their own.
+
+_PADDING = "\x00" * 512
+
+
+def test_a_chunk_of_pure_padding_is_noise():
+    assert is_noise(_PADDING) is True
+
+
+def test_padding_around_framing_text_still_leaves_it_noise():
+    assert is_noise(_PADDING + "LOG_EXTRACT_DONE" + _PADDING) is True
+
+
+def test_padding_before_a_log_line_does_not_stop_it_parsing():
+    line = parse(_PADDING + "I/MODEM [2026-07-01T10:11:11.950Z] Registered")
+    assert line.level == "I"
+    assert line.tag == "MODEM"
+    assert line.message == "Registered"
+
+
+def test_padding_after_a_log_line_is_not_part_of_its_message():
+    line = parse("I/MODEM [2026-07-01T10:11:11.950Z] link up" + _PADDING)
+    assert line.message == "link up"
+    assert "\x00" not in line.raw
+
+
+def test_other_control_bytes_carrying_no_text_are_dropped_too():
+    assert is_noise("\x01\x02\x7f") is True
+
+
+def test_a_tab_inside_a_message_survives():
+    line = parse("I/OCPP  [2026-07-01T10:11:11.950Z] key\tvalue")
+    assert line.message == "key\tvalue"
+
+
+def test_a_replacement_character_is_kept():
+    # U+FFFD is a byte that did not decode — evidence of real corruption on the
+    # wire, not padding. Hiding it would hide the problem.
+    assert is_noise("�") is False

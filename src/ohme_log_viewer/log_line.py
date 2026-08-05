@@ -12,6 +12,14 @@ space, so no fixed tag width may be assumed.
 Assert lines additionally enable directory, function and line info, which
 appears in parentheses straight after the bracket group. No other level does,
 so a leading ``(...)`` on any other level is ordinary message text.
+
+Lines also arrive carrying NUL padding. The CLI framework sends its entire
+512-byte TX buffer for every chunk of a continued command — ``sizeof``, not
+``strlen``, over a buffer it zeroed first (``cli.c``, the
+``CLI_CMD_CONTINUE_EXTRACTION`` branch) — so each chunk of an extraction is
+padded out with NULs. There is no newline among them, so they are not a line of
+their own: they arrive glued to the text on either side, and left in place they
+show as glyph-less boxes and stop the following log line parsing.
 """
 
 from __future__ import annotations
@@ -22,6 +30,27 @@ from dataclasses import dataclass
 #: SGR and other CSI escapes. Colour is disabled in firmware by default, but a
 #: build with it enabled must degrade to correct text rather than a mangled tag.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+#: Control characters that carry no text: chunk padding (NUL) and any other C0
+#: control or DEL. Tab is kept, being real message content, and so are CR and LF
+#: — the caller's line framing depends on them. Undecodable bytes are already
+#: U+FFFD by this point and are deliberately left alone: unlike padding, they
+#: mark data genuinely lost on the wire and should stay visible.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def strip_non_text(raw: str) -> str:
+    """Remove escape sequences and textless control characters from *raw*.
+
+    Public because the reader needs the same notion of "characters the device
+    put on the wire that are not text" to recognise its sentinel through chunk
+    padding, and two definitions of that would drift apart.
+
+    Order matters: taking the control characters out first would leave the
+    printable remainder of an escape sequence — ``[0m`` — as message text.
+    """
+    return _CONTROL_RE.sub("", _ANSI_RE.sub("", raw))
+
 
 #: ``\S+`` takes the tag at any length; ``\s+`` absorbs padding plus separator.
 _LINE_RE = re.compile(
@@ -53,7 +82,7 @@ def parse(raw: str) -> LogLine:
     ``level``, ``tag``, ``timestamp`` and ``source`` all None and its full text
     as ``message``. Unparseable input is never discarded.
     """
-    clean = _ANSI_RE.sub("", raw).rstrip("\r\n")
+    clean = strip_non_text(raw).rstrip("\r\n")
 
     match = _LINE_RE.match(clean)
     if match is None:
@@ -119,7 +148,7 @@ def is_noise(raw: str) -> bool:
     Device-emitted warnings and errors are deliberately not treated as noise —
     they signal a real problem and must stay visible.
     """
-    stripped = _ANSI_RE.sub("", raw).strip()
+    stripped = strip_non_text(raw).strip()
     if not stripped:
         return True
     if stripped in _NOISE_EXACT:

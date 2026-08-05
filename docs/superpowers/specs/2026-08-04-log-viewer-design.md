@@ -80,6 +80,38 @@ chunk-boundary-unaligned read, which surfaces as an empty line with no
 diagnostic value. Older firmware emitted additional multi-line banner text
 around the payload.
 
+**Chunk padding.** `extract_logs` returns `CLI_CMD_CONTINUE_EXTRACTION` for each
+chunk, and for those the CLI framework transmits its whole TX buffer —
+`bsp_cli_write_raw(s_response_buf, sizeof(s_response_buf))`, 512 bytes, over a
+buffer it memset to zero first (`cli.c`). Every chunk therefore arrives padded
+out with NULs, including the state-machine steps that write no text at all. The
+padding contains no newline, so it does not form a line of its own: it arrives
+glued to the text before and after it, and to the sentinel. Untreated it renders
+as glyph-less boxes, stops the following log line parsing, and stops the
+sentinel matching. `log_line.strip_non_text()` removes it, and both `parse()`
+and the reader's marker comparison go through that.
+
+**Authentication.** `extract_logs` is gated by `CLI_REQUIRE_AUTH`, so a
+provisioned device (or one mid-QA) answers it with
+`{"result":"auth_required","challenge":"<32-char hex>"}` and no payload until
+the session is authenticated. Clearing that is a three-command exchange, per
+`cli_cmd_auth.c` and `cli_cmd_system.c`:
+
+```
+extract_logs      → {"result":"auth_required","challenge":"<hex>"}
+get_cli_status    → {"result":"ok","authenticated":false,"charger_id":"OHME-…"}   (whitelisted)
+cli_authenticate <jwt> → {"result":"ok"}
+extract_logs      → payload …
+```
+
+The JWT is ES256 with `{"nonce":"<challenge hex>"}` as its payload; the
+signature is over SHA-256 of that hex string and comes from the Ohme backend
+(`POST /v2/charge-devices/{charger_id}/hardware/qa/sign`), because the CLI auth
+private key never leaves it. The device's verification is software ECDSA on a
+core with no ECC accelerator, so the reply to `cli_authenticate` can take
+seconds. A device with no provisioned charger ID never challenges: the firmware
+clears the requirement and reports itself authenticated.
+
 **Serial parameters.** 115200 baud, 8N1, CRLF line endings.
 
 ## Architecture
@@ -93,6 +125,7 @@ log_viewer/
     log_line.py       LogLine dataclass, parse(), is_noise()          pure logic
     log_buffer.py     ring buffer + tag filter -> visible lines       pure logic
     serial_link.py    pyserial wrapper: open/close, write_line, read_line
+    auth.py           challenge/response handshake + backend challenge signing
     reader.py         QThread running the continuous extract_logs loop
     ui/main_window.py QMainWindow: toolbar + tag panel + log pane + status bar
     ui/tag_panel.py   auto-discovered checkable tag list
@@ -106,6 +139,10 @@ Three boundaries carry the design:
   unit-testable, and they hold all the logic worth testing.
 - `serial_link` is the only module that moves bytes on and off the port, and
   `reader` the only one that runs the `extract_logs` loop on its own thread.
+- `auth` is the only module that talks to the backend, and the only one holding
+  a credential. It is reached solely from the reader's loop, on the reader's
+  thread, and only when a device actually challenges — so a factory-fresh unit
+  is viewed with nothing configured and no HTTP call made.
 - `ui/` owns the pipeline and sequences it: `MainWindow` calls
   `list_usb_ports()`, `link.open()`/`link.close()`, `is_noise()` and `parse()`
   in the order the data flow below describes. What it does not do is any

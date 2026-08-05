@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..auth import DeviceAuthenticator
 from ..log_buffer import MAX_LINES, LogBuffer
 from ..log_line import LogLine, is_noise, parse
 from ..reader import LogReader
@@ -47,10 +48,15 @@ _READER_STOP_TIMEOUT_MS = 1500
 class MainWindow(QMainWindow):
     """Top-level window."""
 
-    def __init__(self) -> None:
+    def __init__(self, link_factory=SerialLink, authenticator_factory=DeviceAuthenticator) -> None:
         super().__init__()
         self.setWindowTitle("Ohme Log Viewer")
         self.resize(1100, 700)
+
+        # Both are per-connection, so they are factories rather than instances:
+        # see _connect for why neither may outlive its session.
+        self._link_factory = link_factory
+        self._authenticator_factory = authenticator_factory
 
         # One link per connection, created in _connect. Never a long-lived
         # instance shared between sessions: a reader that outlives its session
@@ -155,7 +161,7 @@ class MainWindow(QMainWindow):
         # still holds the *previous* link, which _disconnect closed, so it can
         # neither read this session's port nor write its own extract_logs to
         # it — and it cannot race this session on a shared receive buffer.
-        link = SerialLink()
+        link = self._link_factory()
         try:
             link.open(device)
         except SerialLinkError as exc:
@@ -165,7 +171,10 @@ class MainWindow(QMainWindow):
         self._link = link
         self._last_error = None
 
-        self._reader = LogReader(link)
+        # A fresh authenticator too. It caches the charger ID it was told and
+        # the token it fetched, both of which belong to the device that was
+        # connected — reusing them after a swap would sign for the wrong unit.
+        self._reader = LogReader(link, authenticator=self._authenticator_factory())
         self._reader.line_received.connect(self._on_line_received)
         self._reader.error.connect(self._on_reader_error)
         self._reader.finished.connect(self._on_reader_finished)

@@ -33,6 +33,40 @@ So if you need to preserve a device's logs — a field return, a fault you have 
 finished diagnosing, anything you might want a second look at — capture them
 another way first. Connecting is not a read-only operation.
 
+## Authenticated devices
+
+`extract_logs` is a protected command. A device that has finished QA — or one
+that is mid-QA — refuses it until the CLI session is authenticated, answering
+with a challenge instead of logs:
+
+```json
+{"result":"auth_required","challenge":"da641d121b05c32f76ffc52735cedf76"}
+```
+
+The viewer completes that handshake itself: it asks the device for its
+`charger_id` with `get_cli_status`, has the Ohme backend sign the challenge for
+that charger, sends the resulting JWT as `cli_authenticate <jwt>`, and re-sends
+`extract_logs`. The CLI auth private key never leaves the backend. Progress
+appears in the log as `[auth]` lines. A factory-fresh device never challenges,
+and nothing below applies to it.
+
+Signing needs backend credentials, which are read from the `device-cli`
+configuration this machine already has — so if `devcli` works here, the viewer
+does too, and there is no second place keeping your password:
+
+- macOS: `~/Library/Application Support/device-cli/config.toml`, `[app]` section
+  (`be_url`, `email`, `password`)
+- Linux: `~/.config/device-cli/config.toml`
+- Windows: `%APPDATA%/device-cli/config.toml`
+
+`OHME_BE_URL`, `OHME_EMAIL` and `OHME_PASSWORD` override the file. A Firebase
+token that `devcli` has already cached alongside that config is reused, so an
+authenticated device usually costs one HTTP call. The cache is only read, never
+written.
+
+If the credentials are missing or the backend refuses to sign, the session ends
+with that reason in the status bar rather than a silent stall.
+
 ## What it does
 
 - **Port selection** — every serial port on the machine, USB devices annotated
@@ -61,8 +95,12 @@ red, warn amber, info plain, debug and verbose dimmed.
 ```
 
 The parser (`log_line.py`), buffer (`log_buffer.py`), transport
-(`serial_link.py`) and extraction loop (`reader.py`) are covered by unit tests
-and need no hardware. Nor does the reader's `QThread`: `tests/test_log_reader.py`
-drives the real thread and its real signal connections against a fake link, with
-Qt on its offscreen platform. The widgets themselves are checked by the headless
-scripts in the implementation plan and by the on-device smoke test.
+(`serial_link.py`), extraction loop (`reader.py`) and authentication
+(`auth.py`, including its HTTP calls against a fake opener) are covered by unit
+tests and need no hardware. Nor does the reader's `QThread`:
+`tests/test_log_reader.py` drives the real thread and its real signal
+connections against a fake link, with Qt on its offscreen platform.
+`tests/test_main_window.py` covers what the window decides per session — which
+link and authenticator a connection is given — by injecting both. The widgets'
+own behaviour is checked by the headless scripts in the implementation plan and
+by the on-device smoke test.

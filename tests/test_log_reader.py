@@ -17,12 +17,17 @@ from contextlib import contextmanager
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import json
+
 import pytest
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QApplication
 
+from ohme_log_viewer.auth import AuthError
 from ohme_log_viewer.reader import COMMAND, MARKER, LogReader
 from ohme_log_viewer.serial_link import SerialLinkError
+
+AUTH_REQUIRED = json.dumps({"result": "auth_required", "challenge": "a3f1c8" + "00" * 13})
 
 #: Stand-in for the link's real 0.3 s read timeout. Short enough to keep the
 #: tests quick, long enough that an idle reader does not spin on the CPU.
@@ -164,6 +169,48 @@ def test_link_error_reaches_the_error_signal(qapp):
         assert pump_until(qapp, lambda: collector.finished), "thread did not finish"
 
     assert collector.errors == ["port went away"]
+    assert not reader.isRunning()
+
+
+def test_a_challenge_from_the_device_reaches_the_authenticator(qapp):
+    class StubAuthenticator:
+        def __init__(self):
+            self.challenges = []
+
+        def authenticate(self, link, challenge, emit, should_stop):
+            self.challenges.append(challenge)
+            emit("[auth] session authenticated")
+            return True
+
+    link = FakeLink([AUTH_REQUIRED, "after auth", MARKER])
+    authenticator = StubAuthenticator()
+    reader = LogReader(link, authenticator=authenticator)
+    collector = Collector()
+    reader.line_received.connect(collector.on_line)
+
+    with running(reader):
+        assert pump_until(qapp, lambda: "after auth" in collector.lines), collector.lines
+
+    assert authenticator.challenges == ["a3f1c8" + "00" * 13]
+    assert link.written[:2] == [COMMAND, COMMAND]
+    assert AUTH_REQUIRED not in collector.lines
+
+
+def test_an_authentication_failure_reaches_the_error_signal(qapp):
+    class RefusingAuthenticator:
+        def authenticate(self, link, challenge, emit, should_stop):
+            raise AuthError("backend would not sign the challenge")
+
+    reader = LogReader(FakeLink([AUTH_REQUIRED]), authenticator=RefusingAuthenticator())
+    collector = Collector()
+    reader.error.connect(collector.on_error)
+    reader.finished.connect(collector.on_finished)
+
+    with running(reader):
+        assert pump_until(qapp, lambda: collector.errors != []), "no error emitted"
+        assert pump_until(qapp, lambda: collector.finished), "thread did not finish"
+
+    assert collector.errors == ["backend would not sign the challenge"]
     assert not reader.isRunning()
 
 
