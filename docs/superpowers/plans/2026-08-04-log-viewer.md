@@ -4,7 +4,7 @@
 
 **Goal:** Build a standalone PySide6 desktop app that streams EasyLogger output from an Ohme Home Pro V2 device over USB serial, colour-codes it, and lets the user filter by log TAG and clear the view.
 
-**Architecture:** Three layers with hard boundaries. `log_line.py` and `log_buffer.py` are pure Python (no Qt, no serial) and hold all the logic worth testing. `serial_link.py` and `reader.py` are the only modules that touch the port. `ui/` never touches the port or the parser directly — `MainWindow` owns the one pipeline that sequences noise-filter → parse → buffer → display.
+**Architecture:** Three layers with hard boundaries. `log_line.py` and `log_buffer.py` are pure Python (no Qt, no serial) and hold all the logic worth testing. `serial_link.py` is the only module that moves bytes on and off the port, and `reader.py` the only one that runs the `extract_logs` loop on its own thread. `ui/` owns the pipeline and sequences it — `MainWindow` calls `list_usb_ports()`, `link.open()`/`link.close()`, `is_noise()` and `parse()` to drive enumerate → open → noise-filter → parse → buffer → display — but it does no byte-level I/O of its own and implements no parsing of its own.
 
 **Tech Stack:** Python 3.13, PySide6, pyserial, pytest.
 
@@ -61,7 +61,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "black>=24.0", "ruff>=0.5"]
 
 [project.scripts]
 ohme-log-viewer = "ohme_log_viewer.__main__:main"
@@ -74,6 +74,10 @@ testpaths = ["tests"]
 
 [tool.black]
 line-length = 100
+# Pinned to the floor of requires-python. Left unset, black infers the whole
+# open-ended range ">=3.11" — including Python versions that do not exist yet —
+# and then warns that the interpreter running it cannot verify its own output.
+target-version = ["py311"]
 
 [tool.ruff]
 line-length = 100
@@ -526,7 +530,7 @@ letting new ones through.
 from __future__ import annotations
 
 from collections import deque
-from typing import Iterator
+from collections.abc import Iterator
 
 from .log_line import LogLine
 
@@ -617,6 +621,8 @@ Expected: 24 passed.
 - Produces: `SerialLinkError(Exception)`; `PortInfo` frozen dataclass with `device: str` and `label: str`; `list_usb_ports() -> list[PortInfo]`; class `SerialLink` with `__init__(read_timeout_s: float = 0.3, serial_factory=serial.Serial)`, `is_open` property, `open(device: str, baud: int = 115200) -> None`, `close() -> None`, `write_line(text: str) -> None`, `read_line() -> str | None`.
 
 `read_line` returns a complete line with its EOL stripped, or `None` when the read timed out with no complete line available. It never returns a partial line.
+
+The timeout bounds the **call**, not just each underlying `port.read()`. A device streaming bytes with no newline in them — wrong baud rate, binary noise, a garbled boot message — would otherwise keep the loop fed forever: `port.read()` never returns empty, so the call never returns, the reader thread never gets to check for interruption (hanging Disconnect), and the buffer grows without bound. A deadline taken on entry prevents all three.
 
 The injectable `serial_factory` is what makes this testable without hardware — tests pass a fake in place of `serial.Serial`.
 
@@ -723,6 +729,31 @@ def test_read_line_returns_none_on_timeout_without_a_complete_line():
     assert link.read_line() is None
 
 
+def test_read_line_gives_up_on_a_stream_that_never_completes_a_line():
+    """A newline-less stream must not block the call or grow the buffer forever.
+
+    port.read() never returns empty here, so only the call's own deadline can
+    end it. Without that, the reader thread would never regain control to check
+    for interruption and Disconnect would hang.
+    """
+
+    class EndlessNoise:
+        in_waiting = 5
+
+        def read(self, _size):
+            return b"noise"
+
+        def write(self, data):
+            return len(data)
+
+        def close(self):
+            pass
+
+    link = SerialLink(read_timeout_s=0.05, serial_factory=lambda **kwargs: EndlessNoise())
+    link.open("/dev/fake")
+    assert link.read_line() is None
+
+
 def test_read_line_keeps_the_partial_line_for_the_next_call():
     fake = FakeSerial([b"par", b""])
     link = link_with(fake)
@@ -798,6 +829,7 @@ therefore never see half a log line.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import serial
@@ -892,14 +924,24 @@ class SerialLink:
 
         Any bytes read that do not yet form a complete line stay buffered for
         the following call.
+
+        The deadline bounds this call as a whole, not merely each underlying
+        read. A device emitting bytes with no newline among them keeps
+        ``port.read()`` returning data indefinitely, so without the deadline
+        this loop would never hand control back: the caller's thread could not
+        check for interruption and the buffer would grow without limit.
         """
         port = self._require_port()
+        deadline = time.monotonic() + self._read_timeout_s
         while True:
             newline = self._buf.find(b"\n")
             if newline >= 0:
                 raw = bytes(self._buf[:newline])
                 del self._buf[: newline + 1]
                 return raw.decode("utf-8", errors="replace").rstrip("\r")
+
+            if time.monotonic() > deadline:
+                return None  # no complete line within the timeout
 
             try:
                 pending = port.in_waiting or 1
@@ -920,7 +962,7 @@ class SerialLink:
 - [ ] **Step 4: Run the full suite to verify it passes**
 
 Run: `.venv/bin/pytest -v`
-Expected: 38 passed.
+Expected: 39 passed.
 
 ---
 
@@ -931,6 +973,9 @@ The streaming loop is split into a pure function and a thin `QThread` around it.
 **Files:**
 - Create: `src/ohme_log_viewer/reader.py`
 - Create: `tests/test_reader.py`
+- Create: `tests/test_log_reader.py`
+
+`test_reader.py` covers `run_extract_cycle`, which takes no Qt types at all. `test_log_reader.py` covers the `LogReader` thread around it. Both are pure unit tests — no port is opened by either.
 
 **Interfaces:**
 - Consumes: `SerialLink`, `SerialLinkError` from `ohme_log_viewer.serial_link`.
@@ -1063,7 +1108,7 @@ the sentinel from the display cannot desynchronise the TX/RX cycle.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from PySide6.QtCore import QThread, Signal
 
@@ -1134,7 +1179,7 @@ class LogReader(QThread):
         """Ask the loop to finish. Detected within one read timeout."""
         self.requestInterruption()
 
-    def run(self) -> None:  # noqa: D102 - QThread entry point
+    def run(self) -> None:  # QThread entry point; Qt calls this, we never do
         try:
             while not self.isInterruptionRequested():
                 completed = run_extract_cycle(
@@ -1146,9 +1191,11 @@ class LogReader(QThread):
                     return
                 if not self._sleep_interruptibly(CYCLE_DELAY_S):
                     return
-        except SerialLinkError as exc:
-            self.error.emit(str(exc))
-        except OSError as exc:
+        except (SerialLinkError, OSError) as exc:
+            # One clause, not two identical ones. SerialLink converts every
+            # serial/OS failure to SerialLinkError before it reaches here, so
+            # OSError is only reachable via a non-conforming link — worth
+            # catching, not worth a duplicated body.
             self.error.emit(str(exc))
 
     def _sleep_interruptibly(self, seconds: float) -> bool:
@@ -1163,10 +1210,210 @@ class LogReader(QThread):
         return True
 ```
 
-- [ ] **Step 4: Run the full suite to verify it passes**
+- [ ] **Step 4: Cover the QThread glue**
+
+`run_extract_cycle` is now tested, but the thread that drives it is not: whether it actually starts, whether the lines it reads reach a slot across the thread boundary, whether `stop()` ends it, and whether a link failure surfaces on the `error` signal. None of that needs hardware — a fake link and an offscreen `QApplication` exercise the real thread and the real connections. Leaving it to the on-device smoke test would put the branch's most delicate layer behind the one check that requires destroying a device's logs to run.
+
+Signals must be received by a `QObject` built on the main thread, as `MainWindow` does, so Qt delivers them queued rather than calling straight through — a plain function would be invoked directly on the reader's thread and would prove nothing about the real arrangement.
+
+Create `tests/test_log_reader.py`:
+
+```python
+"""Headless tests for the LogReader QThread glue.
+
+The plan assumed this layer could only be checked on hardware. It cannot be
+checked on hardware *safely* — ``extract_logs`` destroys the device's logs — but
+it does not need hardware at all: a fake link and an offscreen QApplication
+exercise the real thread, the real signal connections and the real stop path.
+
+Signals are received by a QObject created on the main thread, which is what
+MainWindow does, so Qt delivers them queued across the thread boundary exactly
+as it does in the running application. That is the part worth testing; the loop
+logic itself is covered by ``test_reader.py`` without any Qt at all.
+"""
+
+import os
+import time
+from contextlib import contextmanager
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QObject
+from PySide6.QtWidgets import QApplication
+
+from ohme_log_viewer.reader import COMMAND, MARKER, LogReader
+from ohme_log_viewer.serial_link import SerialLinkError
+
+#: Stand-in for the link's real 0.3 s read timeout. Short enough to keep the
+#: tests quick, long enough that an idle reader does not spin on the CPU.
+_FAKE_READ_TIMEOUT_S = 0.005
+
+#: Ceiling for every wait in this module. Nothing here should come close to it;
+#: it exists so a broken reader fails the test instead of hanging the suite.
+_WAIT_TIMEOUT_S = 5.0
+
+
+class FakeLink:
+    """Scripted stand-in for SerialLink, read from the reader's thread.
+
+    Each scripted entry is handed out once; once they run out ``read_line``
+    reports a read timeout, which is what a quiet device looks like.
+    """
+
+    def __init__(self, lines=None, raise_on_read=None):
+        self._lines = list(lines or [])
+        self._raise_on_read = raise_on_read
+        self.written: list[str] = []
+
+    def write_line(self, text):
+        self.written.append(text)
+
+    def feed(self, line):
+        """Queue another line mid-test. List ops are atomic, so no lock."""
+        self._lines.append(line)
+
+    def drained(self) -> bool:
+        """True once the reader has consumed every queued line."""
+        return not self._lines
+
+    def read_line(self):
+        if self._raise_on_read is not None:
+            raise self._raise_on_read
+        if self._lines:
+            return self._lines.pop(0)
+        time.sleep(_FAKE_READ_TIMEOUT_S)
+        return None
+
+
+class Collector(QObject):
+    """Slots living on the main thread, so deliveries are genuinely queued."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines: list[str] = []
+        self.errors: list[str] = []
+        self.finished = False
+
+    def on_line(self, text: str) -> None:
+        self.lines.append(text)
+
+    def on_error(self, message: str) -> None:
+        self.errors.append(message)
+
+    def on_finished(self) -> None:
+        self.finished = True
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """The one QApplication. Reused if the process already made one."""
+    return QApplication.instance() or QApplication([])
+
+
+@contextmanager
+def running(reader: LogReader):
+    """Start *reader* and guarantee its thread is joined before the test ends.
+
+    Leaving a QThread running past the end of a test aborts the interpreter, so
+    the join is unconditional rather than an assertion the test body could skip.
+    """
+    reader.start()
+    try:
+        yield reader
+    finally:
+        reader.stop()
+        reader.wait(int(_WAIT_TIMEOUT_S * 1000))
+
+
+def pump_until(app, predicate, timeout_s: float = _WAIT_TIMEOUT_S) -> bool:
+    """Run the event loop until *predicate* holds or the deadline passes."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        app.processEvents()
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.002)
+
+
+def test_started_thread_sends_the_command_and_emits_received_lines(qapp):
+    link = FakeLink(["first", "second", MARKER])
+    reader = LogReader(link)
+    collector = Collector()
+    reader.line_received.connect(collector.on_line)
+
+    with running(reader):
+        assert pump_until(qapp, lambda: len(collector.lines) >= 2), collector.lines
+
+    assert collector.lines[:2] == ["first", "second"]
+    assert MARKER not in collector.lines
+    assert link.written[0] == COMMAND
+
+
+def test_stop_ends_the_thread_promptly(qapp):
+    # No marker is ever sent, so the reader stays in its read loop and only
+    # leaves it because it was asked to.
+    reader = LogReader(FakeLink())
+    reader.start()
+    try:
+        assert pump_until(qapp, reader.isRunning), "thread never started"
+        start = time.monotonic()
+        reader.stop()
+        stopped = reader.wait(int(_WAIT_TIMEOUT_S * 1000))
+        elapsed = time.monotonic() - start
+    finally:
+        reader.stop()
+        reader.wait(int(_WAIT_TIMEOUT_S * 1000))
+
+    assert stopped, "thread did not exit after stop()"
+    assert not reader.isRunning()
+    # Generous next to the 5 s ceiling, tight next to a reader that only
+    # notices interruption between whole extract cycles.
+    assert elapsed < 1.0, elapsed
+
+
+def test_link_error_reaches_the_error_signal(qapp):
+    reader = LogReader(FakeLink(raise_on_read=SerialLinkError("port went away")))
+    collector = Collector()
+    reader.error.connect(collector.on_error)
+    reader.finished.connect(collector.on_finished)
+
+    with running(reader):
+        assert pump_until(qapp, lambda: collector.errors != []), "no error emitted"
+        assert pump_until(qapp, lambda: collector.finished), "thread did not finish"
+
+    assert collector.errors == ["port went away"]
+    assert not reader.isRunning()
+
+
+def test_no_lines_are_emitted_after_the_signal_is_disconnected(qapp):
+    # The path MainWindow relies on when it parks a reader it could not stop:
+    # a disconnected reader must be inert even though it is still running. No
+    # marker is scripted, so the reader stays inside one cycle and picks up a
+    # line fed to it within a read timeout rather than after a cycle delay.
+    link = FakeLink(["before"])
+    reader = LogReader(link)
+    collector = Collector()
+    reader.line_received.connect(collector.on_line)
+
+    with running(reader):
+        assert pump_until(qapp, lambda: collector.lines == ["before"]), collector.lines
+        reader.line_received.disconnect(collector.on_line)
+
+        link.feed("after")
+        # The reader really did read it — it just had nowhere to deliver it.
+        assert pump_until(qapp, link.drained), "reader never consumed the fed line"
+        assert not pump_until(qapp, lambda: "after" in collector.lines, timeout_s=0.2)
+
+    assert collector.lines == ["before"]
+```
+
+- [ ] **Step 5: Run the full suite to verify it passes**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 51 passed.
 
 ---
 
@@ -1204,7 +1451,7 @@ view's memory would grow without bound on a long session.
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QPlainTextEdit, QVBoxLayout, QWidget
@@ -1230,8 +1477,15 @@ _LEVEL_COLOURS = {
 _UNPARSED_COLOUR = "#9cdcfe"
 _ERROR_COLOUR = "#f14c4c"
 
-#: Scroll position tolerance, in pixels, for "the user is at the bottom".
-_AT_BOTTOM_SLACK = 4
+#: Scroll position tolerance, in LINES, for "the user is at the bottom".
+#:
+#: The unit matters. Unlike QTextEdit, QPlainTextEdit's vertical scrollbar is
+#: measured in blocks — one step is one line, not one pixel. Any non-zero slack
+#: is therefore a dead zone several lines deep, and a default mouse-wheel notch
+#: is only three lines: the commonest way of scrolling up to read something
+#: would land inside it and the next append would yank the view back down.
+#: Zero means "exactly at the end", which is what following the tail means.
+_AT_BOTTOM_SLACK = 0
 
 
 class LogPane(QWidget):
@@ -1386,7 +1640,7 @@ Expected: prints `log pane OK`.
 - [ ] **Step 4: Run the full suite to confirm nothing regressed**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 51 passed.
 
 ---
 
@@ -1399,7 +1653,11 @@ Expected: 46 passed.
 - Consumes: nothing from earlier tasks.
 - Produces: class `TagPanel(QWidget)` with signal `tag_toggled = Signal(str, bool)`, and methods `sync(tags: Sequence[str], counts: dict[str, int], enabled: dict[str, bool]) -> None` and `set_all(on: bool) -> None`.
 
-`sync` is idempotent: it adds newly discovered tags, refreshes counts on existing ones, and leaves check state alone otherwise. It is safe to call on every display flush.
+`sync` is idempotent — calling it repeatedly never duplicates a row — and it **mirrors** the caller's `enabled` map onto the checkboxes every time. `LogBuffer` owns filter state, exactly as it owns the lines; the panel is a projection of it, just as `LogPane` is. Mirroring is what makes that projection self-healing: any divergence is corrected on the next flush.
+
+This is safe against the obvious worry — a user's click being reverted by the next flush — because `MainWindow._on_tag_toggled` writes the new state to the buffer as its first statement, and Qt delivers signals synchronously in-thread, so the handler always completes before the flush timer can run. Task 7's verification asserts the mirror behaviour and Task 8's asserts a toggle survives a flush.
+
+The alternative — letting the panel own its check state after creation — would make it a second source of truth for filter state and leave it unable to resync if the buffer's state ever changed by another route.
 
 No unit tests, per the spec. Verification is the headless check in Step 2.
 
@@ -1418,7 +1676,7 @@ tag would squeeze the log pane, which is the part worth the space.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -1456,7 +1714,17 @@ class TagPanel(QWidget):
         counts: dict[str, int],
         enabled: dict[str, bool],
     ) -> None:
-        """Add any new tags and refresh every count. Safe to call repeatedly."""
+        """Add any new tags, refresh every count, and mirror *enabled*.
+
+        Safe to call repeatedly — it updates rows in place and never
+        duplicates one. Check state is mirrored from *enabled* on every call,
+        not just when a row is created: the buffer owns filter state and this
+        panel is a projection of it, so mirroring keeps the two from drifting.
+        The caller must therefore pass its authoritative map.
+
+        Emits nothing. Writing check states fires Qt's ``itemChanged``, which
+        is suppressed here — otherwise every flush would re-apply the filter.
+        """
         self._suppress_signals = True
         try:
             for tag in tags:
@@ -1469,9 +1737,7 @@ class TagPanel(QWidget):
                     self._list.addItem(item)
                     self._items[tag] = item
                 item.setCheckState(
-                    Qt.CheckState.Checked
-                    if enabled.get(tag, True)
-                    else Qt.CheckState.Unchecked
+                    Qt.CheckState.Checked if enabled.get(tag, True) else Qt.CheckState.Unchecked
                 )
                 item.setText(f"{tag}  ({counts.get(tag, 0)})")
         finally:
@@ -1541,6 +1807,20 @@ assert panel._list.item(1).toolTip() == long_tag
 
 panel.set_all(False)
 assert seen == [('MODEM', False), (long_tag, False)], seen
+
+# sync MIRRORS the caller's enabled map: the buffer owns filter state and this
+# panel projects it. A sync carrying enabled=True must therefore re-check a row
+# the user had unchecked — and must still emit nothing while doing it.
+from PySide6.QtCore import Qt
+seen.clear()
+panel.sync(['MODEM', long_tag], {'MODEM': 9, long_tag: 1}, {'MODEM': True, long_tag: True})
+assert panel._list.item(0).checkState() == Qt.CheckState.Checked
+assert seen == [], 'mirroring must not emit'
+
+# ...and a sync carrying False leaves it unchecked, still silently.
+panel.sync(['MODEM', long_tag], {'MODEM': 9, long_tag: 1}, {'MODEM': False, long_tag: True})
+assert panel._list.item(0).checkState() == Qt.CheckState.Unchecked
+assert seen == [], 'mirroring must not emit'
 print('tag panel OK')
 "
 ```
@@ -1550,7 +1830,7 @@ Expected: prints `tag panel OK`.
 - [ ] **Step 3: Run the full suite to confirm nothing regressed**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 51 passed.
 
 ---
 
@@ -1606,6 +1886,16 @@ from .tag_panel import TagPanel
 #: Display batching interval. A burst of lines costs one repaint, not one each.
 _FLUSH_INTERVAL_MS = 100
 
+#: How long to wait for the reader thread to exit before giving up on it.
+#:
+#: This blocks the GUI thread, so it is sized to the reader's own worst case
+#: rather than picked for comfort. Every operation the loop performs is
+#: bounded: a read is capped at the link's 0.3 s timeout, and the inter-cycle
+#: wait is 50 ms slices that check for interruption between each. A reader
+#: that is going to stop at all has therefore stopped well inside 1.5 s;
+#: anything slower is pathological and waiting longer will not rescue it.
+_READER_STOP_TIMEOUT_MS = 1500
+
 
 class MainWindow(QMainWindow):
     """Top-level window."""
@@ -1615,12 +1905,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Ohme Log Viewer")
         self.resize(1100, 700)
 
-        self._link = SerialLink()
+        # One link per connection, created in _connect. Never a long-lived
+        # instance shared between sessions: a reader that outlives its session
+        # would otherwise be holding the very object the next session opens.
+        self._link: SerialLink | None = None
         self._buffer = LogBuffer()
         self._reader: LogReader | None = None
         self._pending: list[LogLine] = []
+        self._rerender_pending = False
         self._received = 0
         self._last_error: str | None = None
+        # Readers that would not stop. Held so neither Qt nor Python frees a
+        # thread object while its OS thread is still running.
+        self._orphaned_readers: list[LogReader] = []
 
         self._build_ui()
         self._refresh_ports()
@@ -1702,18 +1999,26 @@ class MainWindow(QMainWindow):
     def _connect(self) -> None:
         device = self._port_combo.currentData()
         if device is None:
-            self.statusBar().showMessage("No serial port selected")
+            # Via _report_error, not showMessage: the flush timer rewrites the
+            # status text every 100 ms and would erase it before it was read.
+            self._report_error("No serial port selected")
             return
 
+        # A fresh link per connection. If a previous reader had to be parked it
+        # still holds the *previous* link, which _disconnect closed, so it can
+        # neither read this session's port nor write its own extract_logs to
+        # it — and it cannot race this session on a shared receive buffer.
+        link = SerialLink()
         try:
-            self._link.open(device)
+            link.open(device)
         except SerialLinkError as exc:
             self._report_error(f"Could not open {device}: {exc}")
             return
 
+        self._link = link
         self._last_error = None
 
-        self._reader = LogReader(self._link)
+        self._reader = LogReader(link)
         self._reader.line_received.connect(self._on_line_received)
         self._reader.error.connect(self._on_reader_error)
         self._reader.finished.connect(self._on_reader_finished)
@@ -1728,9 +2033,33 @@ class MainWindow(QMainWindow):
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.stop()
-            reader.wait(5000)
-            reader.deleteLater()
-        self._link.close()
+            if reader.wait(_READER_STOP_TIMEOUT_MS):
+                reader.deleteLater()
+            else:
+                # Destroying a QThread Qt still considers running is fatal, and
+                # letting Python collect the wrapper is no better. Park it and
+                # carry on: leaking one stuck thread beats killing the app. The
+                # reader's own reads and sleeps are bounded, so reaching this
+                # means something pathological — say so rather than hiding it.
+                #
+                # Cut its signals first. A parked reader is still running and
+                # will emit whenever it unblocks; left connected it would push
+                # lines into the buffer, or trigger a second _disconnect, long
+                # after the UI said "Disconnected". Parked means inert.
+                reader.line_received.disconnect(self._on_line_received)
+                reader.error.disconnect(self._on_reader_error)
+                reader.finished.disconnect(self._on_reader_finished)
+                self._orphaned_readers.append(reader)
+                self._report_error(
+                    f"Reader thread did not stop within "
+                    f"{_READER_STOP_TIMEOUT_MS / 1000:g}s; leaving it parked"
+                )
+
+        # Closed even for a parked reader: the link drops its port reference,
+        # so the orphan's next call raises instead of touching the device.
+        link, self._link = self._link, None
+        if link is not None:
+            link.close()
 
         self._connect_btn.setText("Connect")
         self._port_combo.setEnabled(True)
@@ -1769,7 +2098,13 @@ class MainWindow(QMainWindow):
             self._pending.append(line)
 
     def _flush(self) -> None:
-        if self._pending:
+        if self._rerender_pending:
+            # A filter change invalidates the whole view, so the incremental
+            # batch is dropped rather than appended on top of the re-render.
+            self._pending.clear()
+            self._pane.render(self._buffer.visible())
+            self._rerender_pending = False
+        elif self._pending:
             self._pane.append_lines(self._pending)
             self._pending.clear()
         self._sync_tags()
@@ -1784,19 +2119,29 @@ class MainWindow(QMainWindow):
         )
 
     def _on_tag_toggled(self, tag: str, on: bool) -> None:
+        """Record a filter change and let the next flush repaint once.
+
+        Re-enabling a tag must bring its earlier lines back, which costs a
+        full re-render of the buffer. Doing that inline made All/None — which
+        emit one signal per tag — cost tags × lines: measured at 3.9 s frozen
+        for None and 4.3 s for All over a full 50,000-line buffer with 30
+        tags. Deferring to the 100 ms flush collapses any number of toggles
+        into a single render. A lone toggle repaints up to 100 ms later, which
+        is exactly how arriving lines already behave.
+        """
         self._buffer.set_tag_enabled(tag, on)
-        # Full re-render, so re-enabling a tag brings its earlier lines back.
-        # The pending batch is dropped first, otherwise those lines would be
-        # appended a second time after already being rendered here.
-        self._pending.clear()
-        self._pane.render(self._buffer.visible())
-        self._update_status()
+        self._rerender_pending = True
 
     def _on_clear_clicked(self) -> None:
         self._buffer.clear()
         self._pending.clear()
+        self._rerender_pending = False
         self._pane.clear()
         self._received = 0
+        # Clear is the user saying "start from what I can see now", and the
+        # pane's [error] notice goes with it, so the status bar must not keep
+        # reporting an error whose line has just been wiped.
+        self._last_error = None
         # Tags and their check states deliberately survive a clear.
         self._sync_tags()
         self._update_status()
@@ -1806,9 +2151,12 @@ class MainWindow(QMainWindow):
             state = f"Streaming from {self._port_combo.currentData()}"
         else:
             state = "Disconnected"
-        # Shown is read from the pane rather than counted here, so it stays
-        # exact across both block-cap eviction and full re-renders.
-        text = f"{state}   |   received: {self._received}   shown: {self._pane.line_count()}"
+        # Read from the pane rather than counted here, so it stays exact across
+        # both block-cap eviction and full re-renders. That makes it a count of
+        # everything on display, [error] notices included — hence "in view"
+        # rather than "shown", which would read as a count of log lines and be
+        # wrong by one every time an error is reported.
+        text = f"{state}   |   received: {self._received}   in view: {self._pane.line_count()}"
         if self._last_error is not None:
             text = f"{text}   |   last error: {self._last_error}"
         self.statusBar().showMessage(text)
@@ -1880,9 +2228,39 @@ assert window._received == 3, window._received
 assert window._pane.line_count() == 3, window._pane.line_count()
 assert window._buffer.tags() == ['MODEM', 'OCPP', '(unparsed)'], window._buffer.tags()
 
+# A toggle re-renders on the next flush, not inline: that is what stops All /
+# None — one signal per tag — costing tags x lines. So flush, then assert.
 window._on_tag_toggled('MODEM', False)
+window._flush()
 assert window._pane.line_count() == 2, window._pane.line_count()
+
+# A user's toggle must survive the next flush. TagPanel.sync mirrors the
+# buffer's filter state onto the checkboxes, so this only holds because
+# _on_tag_toggled writes to the buffer before any flush can read it.
+window._flush()
+assert window._buffer.is_tag_enabled('MODEM') is False
+assert window._pane.line_count() == 2, 'flush must not revert the toggle'
+
 window._on_tag_toggled('MODEM', True)
+window._flush()
+assert window._pane.line_count() == 3, window._pane.line_count()
+window._flush()
+assert window._pane.line_count() == 3, 'flush must not revert the toggle'
+
+# Many toggles must collapse into a single render. Without this, None over a
+# full buffer with 30 tags froze the GUI for about four seconds.
+renders = []
+real_render = window._pane.render
+window._pane.render = lambda lines: (renders.append(1), real_render(lines))[1]
+window._tag_panel.set_all(False)
+assert renders == [], 'a toggle must not render before the flush'
+window._flush()
+assert len(renders) == 1, f'{len(renders)} renders for 3 toggles'
+assert window._pane.line_count() == 0, window._pane.line_count()
+window._tag_panel.set_all(True)
+window._flush()
+assert len(renders) == 2, f'{len(renders)} renders for 6 toggles'
+window._pane.render = real_render
 assert window._pane.line_count() == 3, window._pane.line_count()
 
 # An error must survive the next status refresh rather than being overwritten.
@@ -1890,16 +2268,34 @@ window._report_error('device disconnected')
 window._flush()
 assert 'last error: device disconnected' in window.statusBar().currentMessage()
 
+# Connecting with no port selected must report through the same durable path,
+# not a showMessage that the next flush erases. The combo is emptied first so
+# this holds on a machine that does enumerate serial ports — otherwise the
+# check would try to open a real device instead of taking the no-port branch.
+window._port_combo.clear()
+window._on_connect_clicked()
+window._flush()
+assert window._reader is None, 'no-port path must not start a reader'
+assert window._link is None, 'no-port path must not leave a link behind'
+assert 'No serial port selected' in window.statusBar().currentMessage()
+
 window._on_clear_clicked()
 assert window._received == 0
 assert window._pane.line_count() == 0, window._pane.line_count()
 assert window._buffer.tags() == ['MODEM', 'OCPP', '(unparsed)'], 'tags must survive clear'
+# Clear wipes the [error] notice out of the pane, so the status bar must stop
+# reporting it too. The count is labelled 'in view' rather than 'shown'
+# because it counts every line on display, [error] notices included.
+assert 'last error' not in window.statusBar().currentMessage()
+assert 'received: 0   in view: 0' in window.statusBar().currentMessage()
 window.close()
 print('main window OK')
 "
 ```
 
 Expected: prints `main window OK`. Note the noise lines (`LOG_EXTRACT_DONE` and the blank) are counted nowhere, and `MainMenu>` lands under `(unparsed)`.
+
+A tag toggle re-renders on the next flush rather than inline, so every assertion about the pane after a toggle takes a `_flush()` first. That deferral is what stops All/None — one signal per tag — costing tags × lines; the render-counting block pins it, and the intent of the surrounding assertions is unchanged.
 
 - [ ] **Step 4: Verify the app launches**
 
@@ -1910,7 +2306,7 @@ Expected: a window titled "Ohme Log Viewer" with a port dropdown, Refresh, Conne
 - [ ] **Step 5: Run the full suite**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 51 passed.
 
 ---
 
@@ -1950,6 +2346,17 @@ python3 -m venv .venv
 
 Pick the device's USB serial port from the dropdown and press **Connect**.
 
+## ⚠️ Connecting consumes the device's logs
+
+This viewer streams by sending `extract_logs`, and that command is **destructive
+on the device**: the firmware deletes its archived log files and clears its ring
+buffer once it has read them out. The logs move to your screen rather than being
+copied to it.
+
+So if you need to preserve a device's logs — a field return, a fault you have not
+finished diagnosing, anything you might want a second look at — capture them
+another way first. Connecting is not a read-only operation.
+
 ## What it does
 
 - **Port selection** — every serial port on the machine, USB devices annotated
@@ -1981,27 +2388,39 @@ and need no hardware. The Qt widgets are checked by the headless scripts in the
 implementation plan and by the on-device smoke test.
 ```
 
-- [ ] **Step 2: Smoke test against a device**
+- [ ] **Step 2: Hand the smoke test to the repository owner**
 
-Plug in a Home Pro V2 over USB, then run `.venv/bin/ohme-log-viewer` and confirm each of these:
+**This step is not run by the implementer.** `extract_logs` deletes the device's
+archived logs and clears its ring buffer, so running it decides on the owner's
+behalf that a particular charger's logs are expendable. That is theirs to
+decide, not ours. Write the checklist below into the report as a handover and
+stop there.
+
+The owner runs `.venv/bin/ohme-log-viewer` with a Home Pro V2 plugged in — one
+whose logs they are content to clear — and confirms each of these:
 
 1. The device's port appears in the dropdown with a VID:PID annotation.
 2. **Connect** starts lines flowing within a couple of seconds, and the button becomes **Disconnect**.
-3. The status bar shows the port and a rising received/shown count.
+3. The status bar reads `Streaming from <device>   |   received: N   in view: M`, both numbers rising. (`in view` counts every line on display, `[error]` notices included, which is why it is not called `shown`.)
 4. Tags accumulate in the left panel with counts that keep climbing.
 5. Unchecking a busy tag makes its lines disappear from the pane, including ones already on screen.
 6. Re-checking it brings those earlier lines back in the right order.
-7. **None** then **All** empties and restores the pane.
+7. **None** then **All** empties and restores the pane — run this after several minutes of streaming, against a large buffer. On a near-empty one it looks instant however expensive it is, which is exactly how a tags × lines cost stayed hidden before.
 8. Errors show red, warnings amber, info plain.
 9. **Clear** empties the pane but leaves the tag list and check states as they were.
-10. Scrolling up stops the view auto-scrolling; scrolling back to the bottom resumes it.
+10. **One mouse-wheel notch** up stops the view auto-scrolling; scrolling back to the bottom resumes it. One notch specifically: a default notch is three lines, and overshooting by a screenful would pass this check even with the tolerance mis-set.
 11. **Disconnect** stops the stream within about a second and re-enables the port dropdown.
 12. Unplugging the USB cable mid-stream shows a red `[error]` line and a status-bar message, returns the UI to disconnected, and leaves the already-captured lines readable and filterable.
 13. Closing the window exits cleanly with no `QThread: Destroyed while thread is still running` message on the console.
+14. A `(unparsed)` group appears in the tag panel. Record what actually lands in it — command echo, the `MainMenu>` prompt, boot banner, something else — and confirm unchecking it leaves a clean view of parsed log lines only. Nothing else tests this group.
+15. **Disconnect**, then **Connect** again on the same port. The second session is clean: lines flow, counts rise from where they were, no duplicated or interleaved output, and no `[error]` about a parked reader. This is the one check that exercises the per-connection `SerialLink`.
+16. Leave it streaming past 50,000 lines. The pane and the buffer still agree — with every tag checked, `in view` stops rising at the cap rather than drifting away from it — and the process's memory stays flat rather than climbing.
 
-Record any of the 13 that fail. Fix them before calling the work done.
+Any of the 16 that fail become findings. Until the owner has run it, the branch
+is complete only up to what can be verified without hardware — say so plainly
+rather than implying the app is proven end to end.
 
 - [ ] **Step 3: Final full-suite run**
 
 Run: `.venv/bin/pytest -v`
-Expected: 46 passed.
+Expected: 51 passed.

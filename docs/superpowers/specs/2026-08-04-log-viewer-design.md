@@ -104,8 +104,13 @@ Three boundaries carry the design:
 
 - `log_line` and `log_buffer` are pure Python — no Qt, no serial. Fully
   unit-testable, and they hold all the logic worth testing.
-- `reader` is the only module that touches the serial port.
-- `ui/` never touches the serial port or the parser directly.
+- `serial_link` is the only module that moves bytes on and off the port, and
+  `reader` the only one that runs the `extract_logs` loop on its own thread.
+- `ui/` owns the pipeline and sequences it: `MainWindow` calls
+  `list_usb_ports()`, `link.open()`/`link.close()`, `is_noise()` and `parse()`
+  in the order the data flow below describes. What it does not do is any
+  byte-level I/O of its own or any parsing of its own — nothing in `ui/`
+  imports pyserial, and nothing in `ui/` knows the log line format.
 
 ### Module contracts
 
