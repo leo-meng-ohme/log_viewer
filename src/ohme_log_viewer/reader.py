@@ -19,7 +19,7 @@ the sentinel from the display cannot desynchronise the TX/RX cycle.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from PySide6.QtCore import QThread, Signal
 
@@ -90,7 +90,7 @@ class LogReader(QThread):
         """Ask the loop to finish. Detected within one read timeout."""
         self.requestInterruption()
 
-    def run(self) -> None:  # noqa: D102 - QThread entry point
+    def run(self) -> None:  # QThread entry point; Qt calls this, we never do
         try:
             while not self.isInterruptionRequested():
                 completed = run_extract_cycle(

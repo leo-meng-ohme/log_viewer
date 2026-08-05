@@ -9,7 +9,7 @@ letting new ones through.
 from __future__ import annotations
 
 from collections import deque
-from typing import Iterator
+from collections.abc import Iterator
 
 from .log_line import LogLine
 

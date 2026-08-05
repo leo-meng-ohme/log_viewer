@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "black>=24.0", "ruff>=0.5"]
 
 [project.scripts]
 ohme-log-viewer = "ohme_log_viewer.__main__:main"
@@ -26,6 +26,10 @@ testpaths = ["tests"]
 
 [tool.black]
 line-length = 100
+# Pinned to the floor of requires-python. Left unset, black infers the whole
+# open-ended range ">=3.11" — including Python versions that do not exist yet —
+# and then warns that the interpreter running it cannot verify its own output.
+target-version = ["py311"]
 
 [tool.ruff]
 line-length = 100

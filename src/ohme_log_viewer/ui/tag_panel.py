@@ -8,7 +8,7 @@ tag would squeeze the log pane, which is the part worth the space.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -69,9 +69,7 @@ class TagPanel(QWidget):
                     self._list.addItem(item)
                     self._items[tag] = item
                 item.setCheckState(
-                    Qt.CheckState.Checked
-                    if enabled.get(tag, True)
-                    else Qt.CheckState.Unchecked
+                    Qt.CheckState.Checked if enabled.get(tag, True) else Qt.CheckState.Unchecked
                 )
                 item.setText(f"{tag}  ({counts.get(tag, 0)})")
         finally:
