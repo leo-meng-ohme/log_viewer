@@ -34,7 +34,14 @@ from .tag_panel import TagPanel
 _FLUSH_INTERVAL_MS = 100
 
 #: How long to wait for the reader thread to exit before giving up on it.
-_READER_STOP_TIMEOUT_MS = 5000
+#:
+#: This blocks the GUI thread, so it is sized to the reader's own worst case
+#: rather than picked for comfort. Every operation the loop performs is
+#: bounded: a read is capped at the link's 0.3 s timeout, and the inter-cycle
+#: wait is 50 ms slices that check for interruption between each. A reader
+#: that is going to stop at all has therefore stopped well inside 1.5 s;
+#: anything slower is pathological and waiting longer will not rescue it.
+_READER_STOP_TIMEOUT_MS = 1500
 
 
 class MainWindow(QMainWindow):
@@ -192,7 +199,7 @@ class MainWindow(QMainWindow):
                 self._orphaned_readers.append(reader)
                 self._report_error(
                     f"Reader thread did not stop within "
-                    f"{_READER_STOP_TIMEOUT_MS // 1000}s; leaving it parked"
+                    f"{_READER_STOP_TIMEOUT_MS / 1000:g}s; leaving it parked"
                 )
 
         # Closed even for a parked reader: the link drops its port reference,
@@ -278,6 +285,10 @@ class MainWindow(QMainWindow):
         self._rerender_pending = False
         self._pane.clear()
         self._received = 0
+        # Clear is the user saying "start from what I can see now", and the
+        # pane's [error] notice goes with it, so the status bar must not keep
+        # reporting an error whose line has just been wiped.
+        self._last_error = None
         # Tags and their check states deliberately survive a clear.
         self._sync_tags()
         self._update_status()
@@ -287,9 +298,12 @@ class MainWindow(QMainWindow):
             state = f"Streaming from {self._port_combo.currentData()}"
         else:
             state = "Disconnected"
-        # Shown is read from the pane rather than counted here, so it stays
-        # exact across both block-cap eviction and full re-renders.
-        text = f"{state}   |   received: {self._received}   shown: {self._pane.line_count()}"
+        # Read from the pane rather than counted here, so it stays exact across
+        # both block-cap eviction and full re-renders. That makes it a count of
+        # everything on display, [error] notices included — hence "in view"
+        # rather than "shown", which would read as a count of log lines and be
+        # wrong by one every time an error is reported.
+        text = f"{state}   |   received: {self._received}   in view: {self._pane.line_count()}"
         if self._last_error is not None:
             text = f"{text}   |   last error: {self._last_error}"
         self.statusBar().showMessage(text)
