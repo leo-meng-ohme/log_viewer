@@ -1,9 +1,11 @@
 """Auto-discovered, checkable list of log tags.
 
-Tags appear as soon as a line carrying them arrives, checked by default. A
-device tag can be arbitrarily long, so the list has a fixed width and elides
-long names with the full text in a tooltip — sizing the column to the longest
-tag would squeeze the log pane, which is the part worth the space.
+Tags appear as soon as a line carrying them arrives, checked by default, and the
+list is kept in alphabetical order — a tag discovered mid-session is inserted
+where it belongs rather than appended, so a name stays where the eye last found
+it. A device tag can be arbitrarily long, so the list has a fixed width and
+elides long names with the full text in a tooltip — sizing the column to the
+longest tag would squeeze the log pane, which is the part worth the space.
 
 The list is multi-select, and a check state applied to any row of the selection
 applies to the whole selection: on a device with thirty tags, narrowing the view
@@ -28,10 +30,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..log_buffer import UNPARSED_TAG
+
 _PANEL_WIDTH_PX = 200
 
 #: Item data role holding the full, unelided tag.
 _TAG_ROLE = Qt.ItemDataRole.UserRole
+
+
+def _sort_key(tag: str) -> tuple[bool, str]:
+    """Order tags alphabetically, with the unparsed group always last.
+
+    Case is ignored, so a lower-case tag does not sort away from its
+    neighbours. ``(unparsed)`` is pinned to the bottom rather than left to the
+    alphabet, where its bracket would put it above every real tag: it is a
+    catch-all for lines that did not parse, not a tag the device emitted.
+    """
+    return (tag == UNPARSED_TAG, tag.casefold())
 
 
 class TagPanel(QWidget):
@@ -76,7 +91,7 @@ class TagPanel(QWidget):
                     item.setData(_TAG_ROLE, tag)
                     item.setToolTip(tag)
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    self._list.addItem(item)
+                    self._list.insertItem(self._row_for(tag), item)
                     self._items[tag] = item
                 item.setCheckState(
                     Qt.CheckState.Checked if enabled.get(tag, True) else Qt.CheckState.Unchecked
@@ -108,6 +123,21 @@ class TagPanel(QWidget):
             self.tag_toggled.emit(item.data(_TAG_ROLE), on)
 
     # ── internals ────────────────────────────────────────────────────────
+
+    def _row_for(self, tag: str) -> int:
+        """Return the row *tag* belongs at to keep the list in order.
+
+        A new row is inserted in place rather than the list being re-sorted,
+        because ``sync`` runs on every 100 ms flush: re-sorting there would move
+        rows under the user's cursor and put the selection and check states at
+        risk on a code path that usually has nothing to do. Inserting touches
+        the list only when a genuinely new tag is discovered.
+        """
+        key = _sort_key(tag)
+        for row in range(self._list.count()):
+            if _sort_key(self._list.item(row).data(_TAG_ROLE)) > key:
+                return row
+        return self._list.count()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)

@@ -14,6 +14,7 @@ from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from ohme_log_viewer.log_buffer import UNPARSED_TAG
 from ohme_log_viewer.ui.tag_panel import TagPanel
 
 TAGS = ["CHARGING", "MODEM", "OCPP", "RCD"]
@@ -191,6 +192,80 @@ def test_all_emits_only_for_the_tags_it_changed(panel):
     select(panel, "MODEM", "OCPP")
     widget.set_all(True)
     assert sorted(emitted) == [("MODEM", True), ("OCPP", True)]
+
+
+# ── ordering ─────────────────────────────────────────────────────────────
+
+
+def rows(panel):
+    widget, _ = panel
+    return [
+        widget._list.item(row).data(Qt.ItemDataRole.UserRole) for row in range(widget._list.count())
+    ]
+
+
+def show(qapp, *tags):
+    """A panel that has seen *tags* in the order given."""
+    widget = TagPanel()
+    widget.sync(list(tags), {tag: 1 for tag in tags}, {tag: True for tag in tags})
+    return widget, []
+
+
+def test_tags_are_listed_alphabetically_whatever_order_they_arrive_in(qapp):
+    panel = show(qapp, "RCD", "CHARGING", "OCPP", "MODEM")
+    assert rows(panel) == ["CHARGING", "MODEM", "OCPP", "RCD"]
+
+
+def test_a_tag_discovered_later_takes_its_place_rather_than_the_end(qapp):
+    # Tags appear as their first line arrives, so most of them turn up after
+    # the list is already built.
+    panel = show(qapp, "MODEM", "RCD")
+    widget, _ = panel
+    widget.sync(
+        ["MODEM", "RCD", "OCPP"],
+        {"MODEM": 1, "RCD": 1, "OCPP": 1},
+        {"MODEM": True, "RCD": True, "OCPP": True},
+    )
+    assert rows(panel) == ["MODEM", "OCPP", "RCD"]
+
+
+def test_ordering_ignores_case(qapp):
+    panel = show(qapp, "modem", "CHARGING", "Ocpp")
+    assert rows(panel) == ["CHARGING", "modem", "Ocpp"]
+
+
+def test_the_unparsed_group_sorts_last_despite_its_bracket(qapp):
+    panel = show(qapp, UNPARSED_TAG, "RCD", "CHARGING")
+    assert rows(panel) == ["CHARGING", "RCD", UNPARSED_TAG]
+
+
+def test_a_new_tag_does_not_disturb_the_selection(qapp):
+    panel = show(qapp, "MODEM", "RCD")
+    widget, _ = panel
+    widget._items["MODEM"].setSelected(True)
+    widget._items["RCD"].setSelected(True)
+    widget.sync(
+        ["MODEM", "RCD", "CHARGING"],
+        {"MODEM": 1, "RCD": 1, "CHARGING": 1},
+        {"MODEM": True, "RCD": True, "CHARGING": True},
+    )
+    assert selected_tags(panel) == {"MODEM", "RCD"}
+
+
+def test_a_new_tag_does_not_disturb_the_check_states_around_it(qapp):
+    panel = show(qapp, "MODEM", "RCD")
+    widget, _ = panel
+    enabled = {"MODEM": False, "RCD": True, "CHARGING": True}
+    widget.sync(["MODEM", "RCD", "CHARGING"], {tag: 1 for tag in enabled}, enabled)
+    assert widget._items["MODEM"].checkState() == Qt.CheckState.Unchecked
+    assert widget._items["RCD"].checkState() == Qt.CheckState.Checked
+
+
+def test_each_row_still_shows_its_tag_and_count(qapp):
+    panel = show(qapp, "RCD", "MODEM")
+    widget, _ = panel
+    widget.sync(["RCD", "MODEM"], {"RCD": 7, "MODEM": 3}, {"RCD": True, "MODEM": True})
+    assert [widget._list.item(row).text() for row in range(2)] == ["MODEM  (3)", "RCD  (7)"]
 
 
 def test_the_selection_survives_a_sync_flush(panel):

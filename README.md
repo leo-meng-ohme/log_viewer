@@ -79,6 +79,10 @@ with that reason in the status bar rather than a silent stall.
   tag's lines; re-checking brings them back, including lines that arrived while
   it was hidden. Lines that do not match the EasyLogger format are grouped under
   `(unparsed)` rather than discarded.
+- **Alphabetical order** — the list stays sorted, ignoring case, and a tag first
+  seen mid-session slots into place instead of landing at the bottom, so a name
+  stays where you last found it. `(unparsed)` is pinned last, being a catch-all
+  rather than a tag the device emitted.
 - **Flipping several tags at once** — select a group first (shift-click for a
   run, ⌘-click to add or drop one, or drag), then tick or untick any one of them
   and the whole selection follows. Space does the same. The selection survives,
