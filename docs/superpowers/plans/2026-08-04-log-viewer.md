@@ -1439,7 +1439,11 @@ Expected: 47 passed.
 - Consumes: nothing from earlier tasks.
 - Produces: class `TagPanel(QWidget)` with signal `tag_toggled = Signal(str, bool)`, and methods `sync(tags: Sequence[str], counts: dict[str, int], enabled: dict[str, bool]) -> None` and `set_all(on: bool) -> None`.
 
-`sync` is idempotent: it adds newly discovered tags, refreshes counts on existing ones, and leaves check state alone otherwise. It is safe to call on every display flush.
+`sync` is idempotent — calling it repeatedly never duplicates a row — and it **mirrors** the caller's `enabled` map onto the checkboxes every time. `LogBuffer` owns filter state, exactly as it owns the lines; the panel is a projection of it, just as `LogPane` is. Mirroring is what makes that projection self-healing: any divergence is corrected on the next flush.
+
+This is safe against the obvious worry — a user's click being reverted by the next flush — because `MainWindow._on_tag_toggled` writes the new state to the buffer as its first statement, and Qt delivers signals synchronously in-thread, so the handler always completes before the flush timer can run. Task 7's verification asserts the mirror behaviour and Task 8's asserts a toggle survives a flush.
+
+The alternative — letting the panel own its check state after creation — would make it a second source of truth for filter state and leave it unable to resync if the buffer's state ever changed by another route.
 
 No unit tests, per the spec. Verification is the headless check in Step 2.
 
@@ -1496,7 +1500,17 @@ class TagPanel(QWidget):
         counts: dict[str, int],
         enabled: dict[str, bool],
     ) -> None:
-        """Add any new tags and refresh every count. Safe to call repeatedly."""
+        """Add any new tags, refresh every count, and mirror *enabled*.
+
+        Safe to call repeatedly — it updates rows in place and never
+        duplicates one. Check state is mirrored from *enabled* on every call,
+        not just when a row is created: the buffer owns filter state and this
+        panel is a projection of it, so mirroring keeps the two from drifting.
+        The caller must therefore pass its authoritative map.
+
+        Emits nothing. Writing check states fires Qt's ``itemChanged``, which
+        is suppressed here — otherwise every flush would re-apply the filter.
+        """
         self._suppress_signals = True
         try:
             for tag in tags:
@@ -1581,6 +1595,20 @@ assert panel._list.item(1).toolTip() == long_tag
 
 panel.set_all(False)
 assert seen == [('MODEM', False), (long_tag, False)], seen
+
+# sync MIRRORS the caller's enabled map: the buffer owns filter state and this
+# panel projects it. A sync carrying enabled=True must therefore re-check a row
+# the user had unchecked — and must still emit nothing while doing it.
+from PySide6.QtCore import Qt
+seen.clear()
+panel.sync(['MODEM', long_tag], {'MODEM': 9, long_tag: 1}, {'MODEM': True, long_tag: True})
+assert panel._list.item(0).checkState() == Qt.CheckState.Checked
+assert seen == [], 'mirroring must not emit'
+
+# ...and a sync carrying False leaves it unchecked, still silently.
+panel.sync(['MODEM', long_tag], {'MODEM': 9, long_tag: 1}, {'MODEM': False, long_tag: True})
+assert panel._list.item(0).checkState() == Qt.CheckState.Unchecked
+assert seen == [], 'mirroring must not emit'
 print('tag panel OK')
 "
 ```
@@ -1922,8 +1950,18 @@ assert window._buffer.tags() == ['MODEM', 'OCPP', '(unparsed)'], window._buffer.
 
 window._on_tag_toggled('MODEM', False)
 assert window._pane.line_count() == 2, window._pane.line_count()
+
+# A user's toggle must survive the next flush. TagPanel.sync mirrors the
+# buffer's filter state onto the checkboxes, so this only holds because
+# _on_tag_toggled writes to the buffer before any flush can read it.
+window._flush()
+assert window._buffer.is_tag_enabled('MODEM') is False
+assert window._pane.line_count() == 2, 'flush must not revert the toggle'
+
 window._on_tag_toggled('MODEM', True)
 assert window._pane.line_count() == 3, window._pane.line_count()
+window._flush()
+assert window._pane.line_count() == 3, 'flush must not revert the toggle'
 
 # An error must survive the next status refresh rather than being overwritten.
 window._report_error('device disconnected')
