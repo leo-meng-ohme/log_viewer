@@ -79,6 +79,11 @@ with that reason in the status bar rather than a silent stall.
   tag's lines; re-checking brings them back, including lines that arrived while
   it was hidden. Lines that do not match the EasyLogger format are grouped under
   `(unparsed)` rather than discarded.
+- **Flipping several tags at once** — select a group first (shift-click for a
+  run, ⌘-click to add or drop one, or drag), then tick or untick any one of them
+  and the whole selection follows. Space does the same. The selection survives,
+  so the same group can be flipped back without picking it out again. A tag you
+  have not selected still toggles on its own, as before.
 - **Clear** — empties the view and the buffer but keeps your tag list and
   check states, so clearing before a test run does not cost you the filter
   setup.
@@ -101,6 +106,9 @@ tests and need no hardware. Nor does the reader's `QThread`:
 `tests/test_log_reader.py` drives the real thread and its real signal
 connections against a fake link, with Qt on its offscreen platform.
 `tests/test_main_window.py` covers what the window decides per session — which
-link and authenticator a connection is given — by injecting both. The widgets'
-own behaviour is checked by the headless scripts in the implementation plan and
-by the on-device smoke test.
+link and authenticator a connection is given — by injecting both, and follows one
+tag filter change from the panel through to the lines left in view.
+`tests/test_tag_panel.py` drives the real tag list with `QTest` clicks and
+keystrokes, so the multi-select behaviour is checked against Qt itself rather
+than a stub. What remains for the on-device smoke test is the parts only a real
+device exercises: the authenticated handshake and a live extraction.

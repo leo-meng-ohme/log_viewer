@@ -1,9 +1,11 @@
-"""Headless tests for the window's connection wiring.
+"""Headless tests for what the window itself decides.
 
-Only what the window itself decides is covered here — which collaborators a
-session is given and what reaches the buffer — because that is where a fix can
-be complete in the reader and still never run in the application. The widgets'
-own behaviour stays with the plan's headless scripts.
+Which collaborators a session is given, and what reaches the buffer, because
+that is where a fix can be complete in the reader or the panel and still never
+run in the application. One test follows a tag filter change all the way from a
+click in the panel to the lines left in view, since that path crosses three
+components and the 100 ms flush that batches them. Widget behaviour in isolation
+belongs to ``test_tag_panel.py``.
 """
 
 import json
@@ -13,6 +15,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from ohme_log_viewer.auth import DeviceAuthenticator
@@ -87,6 +90,38 @@ def connected(qapp, link, authenticator):
 
 def raw_lines(window):
     return [line.raw for line in window._buffer.visible()]
+
+
+def test_hiding_a_selection_of_tags_removes_their_lines_from_the_view(qapp):
+    """The whole path in one go: a propagated tick in the panel reaches the
+    buffer's filter and the pane, through the 100 ms flush that batches it."""
+    lines = [
+        "I/MODEM [t] modem line",
+        "I/OCPP  [t] ocpp line",
+        "I/RCD   [t] rcd line",
+        MARKER,
+    ]
+    window = connected(qapp, FakeLink(lines), StubAuthenticator())
+    try:
+        panel = window._tag_panel
+        # The buffer fills on the reader's signal, but the panel's rows appear
+        # on the next 100 ms flush — so wait for the rows, not the lines.
+        assert pump_until(qapp, lambda: {"MODEM", "OCPP", "RCD"} <= set(panel._items)), sorted(
+            panel._items
+        )
+        assert len(raw_lines(window)) == 3, raw_lines(window)
+
+        panel._list.clearSelection()
+        for tag in ("MODEM", "OCPP"):
+            panel._items[tag].setSelected(True)
+
+        # One tick on one of the two selected rows.
+        panel._items["MODEM"].setCheckState(Qt.CheckState.Unchecked)
+
+        assert pump_until(qapp, lambda: len(raw_lines(window)) == 1), raw_lines(window)
+        assert raw_lines(window) == ["I/RCD   [t] rcd line"]
+    finally:
+        window.close()
 
 
 def test_a_session_answers_a_challenge_through_its_authenticator(qapp):
