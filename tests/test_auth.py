@@ -502,6 +502,112 @@ def test_a_silent_device_times_out_the_handshake():
         )
 
 
+# ── retryable or not ─────────────────────────────────────────────────────
+#
+# A refusal never fixes itself and must stop the viewer's retry loop. A device
+# or network transient must not, or a device rebooting mid-handshake would end
+# the session it is trying to keep.
+
+
+def test_a_device_that_never_answers_is_a_retryable_failure():
+    clock = [0.0]
+
+    def now():
+        clock[0] += 10.0
+        return clock[0]
+
+    with pytest.raises(AuthError) as excinfo:
+        DeviceAuthenticator(signer=signer_for(), now=now).authenticate(
+            FakeLink(), CHALLENGE, lambda _line: None
+        )
+    assert excinfo.value.retryable is True
+
+
+def test_a_backend_refusal_is_not_retryable(tmp_path):
+    cache_file(tmp_path)
+    http = FakeHttp(
+        {
+            "/hardware/qa/sign": urllib.error.HTTPError(
+                "https://api-dev2.ohme.io/x", 403, "Forbidden", {}, io.BytesIO(b"nope")
+            )
+        }
+    )
+    with pytest.raises(AuthError) as excinfo:
+        make_signer(tmp_path, http).sign_challenge(CHALLENGE, "OHME-GB-000123")
+    assert excinfo.value.retryable is False
+
+
+def test_a_backend_server_error_is_retryable(tmp_path):
+    cache_file(tmp_path)
+    http = FakeHttp(
+        {
+            "/hardware/qa/sign": urllib.error.HTTPError(
+                "https://api-dev2.ohme.io/x", 503, "Unavailable", {}, io.BytesIO(b"try later")
+            )
+        }
+    )
+    with pytest.raises(AuthError) as excinfo:
+        make_signer(tmp_path, http).sign_challenge(CHALLENGE, "OHME-GB-000123")
+    assert excinfo.value.retryable is True
+
+
+def test_an_unreachable_backend_is_retryable(tmp_path):
+    cache_file(tmp_path)
+    http = FakeHttp({"/hardware/qa/sign": urllib.error.URLError("network is down")})
+    with pytest.raises(AuthError) as excinfo:
+        make_signer(tmp_path, http).sign_challenge(CHALLENGE, "OHME-GB-000123")
+    assert excinfo.value.retryable is True
+
+
+def test_an_unreachable_firebase_is_retryable(tmp_path):
+    http = FakeHttp({"signInWithPassword": urllib.error.URLError("network is down")})
+    with pytest.raises(AuthError) as excinfo:
+        make_signer(tmp_path, http).sign_challenge(CHALLENGE, "OHME-GB-000123")
+    assert excinfo.value.retryable is True
+
+
+def test_a_rejected_password_is_not_retryable(tmp_path):
+    http = FakeHttp(
+        {
+            "signInWithPassword": urllib.error.HTTPError(
+                "https://identitytoolkit.googleapis.com/x",
+                400,
+                "Bad Request",
+                {},
+                io.BytesIO(b'{"error":{"message":"INVALID_PASSWORD"}}'),
+            )
+        }
+    )
+    with pytest.raises(AuthError) as excinfo:
+        make_signer(tmp_path, http).sign_challenge(CHALLENGE, "OHME-GB-000123")
+    assert excinfo.value.retryable is False
+
+
+def test_missing_credentials_are_not_retryable(tmp_path):
+    with pytest.raises(AuthError) as excinfo:
+        load_credentials(config_dir=tmp_path, env={})
+    assert excinfo.value.retryable is False
+
+
+def test_a_rejected_jwt_is_not_retryable():
+    link = FakeLink(
+        {
+            STATUS_COMMAND: ok_status(),
+            AUTH_COMMAND: ['{"result":"error","msg":"nonce_mismatch"}'],
+        }
+    )
+    with pytest.raises(AuthError) as excinfo:
+        DeviceAuthenticator(signer=signer_for()).authenticate(link, CHALLENGE, lambda _line: None)
+    assert excinfo.value.retryable is False
+
+
+def test_an_unprovisioned_device_is_not_retryable():
+    link = FakeLink({STATUS_COMMAND: ok_status(charger_id="")})
+    with pytest.raises(AuthError) as excinfo:
+        DeviceAuthenticator(signer=signer_for()).authenticate(link, CHALLENGE, lambda _line: None)
+    assert excinfo.value.retryable is False
+
+
 def test_the_signer_is_built_from_the_config_only_when_auth_is_needed(tmp_path):
     """A device that never challenges must work with no credentials configured."""
     built = []

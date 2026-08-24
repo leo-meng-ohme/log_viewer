@@ -89,3 +89,55 @@ def test_setting_an_unknown_tag_is_ignored():
     buffer = LogBuffer()
     buffer.set_tag_enabled("NEVER_SEEN", False)
     assert buffer.tags() == []
+
+
+# ── refreshing the tag list ──────────────────────────────────────────────
+
+
+def test_refresh_tags_forgets_tags_with_no_lines_left():
+    buffer = LogBuffer()
+    buffer.append(parse("I/MODEM [t] one"))
+    buffer.clear()  # keeps tags by design; refresh is how you get rid of them
+    buffer.refresh_tags()
+    assert buffer.tags() == []
+
+
+def test_refresh_tags_rebuilds_from_the_lines_still_stored():
+    buffer = LogBuffer()
+    buffer.append(parse("I/MODEM [t] one"))
+    buffer.append(parse("I/OCPP  [t] two"))
+    buffer.refresh_tags()
+    assert sorted(buffer.tags()) == ["MODEM", "OCPP"]
+    assert buffer.count_for("MODEM") == 1
+    assert buffer.count_for("OCPP") == 1
+
+
+def test_refresh_tags_re_enables_every_tag():
+    buffer = LogBuffer()
+    buffer.append(parse("I/MODEM [t] one"))
+    buffer.set_tag_enabled("MODEM", False)
+    buffer.refresh_tags()
+    assert buffer.is_tag_enabled("MODEM") is True
+    assert [line.message for line in buffer.visible()] == ["one"]
+
+
+def test_refresh_tags_counts_only_what_is_stored():
+    # Counts otherwise total everything received, which on a long session runs
+    # ahead of what the capped buffer still holds.
+    buffer = LogBuffer(max_lines=2)
+    for index in range(5):
+        buffer.append(parse(f"I/MODEM [t] line {index}"))
+    assert buffer.count_for("MODEM") == 5
+    buffer.refresh_tags()
+    assert buffer.count_for("MODEM") == 2
+
+
+def test_refresh_tags_drops_the_unparsed_group_once_it_is_empty():
+    buffer = LogBuffer()
+    buffer.append(parse("not a log line"))
+    buffer.append(parse("I/MODEM [t] one"))
+    assert UNPARSED_TAG in buffer.tags()
+    buffer.clear()
+    buffer.append(parse("I/MODEM [t] two"))
+    buffer.refresh_tags()
+    assert buffer.tags() == ["MODEM"]

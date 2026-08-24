@@ -130,7 +130,15 @@ class LogReader(QThread):
     """Runs :func:`run_extract_cycle` back to back until interrupted."""
 
     line_received: Signal = Signal(str)
+
+    #: A failure worth another attempt: the port, the device, or a transient on
+    #: the way to the backend.
     error: Signal = Signal(str)
+
+    #: A refusal. Separate from ``error`` because the two demand opposite
+    #: responses: the window retries the one and gives up on the other, and no
+    #: amount of waiting turns a rejected credential into an accepted one.
+    auth_failed: Signal = Signal(str)
 
     def __init__(self, link: SerialLink, authenticator=None, parent=None) -> None:
         super().__init__(parent)
@@ -154,7 +162,14 @@ class LogReader(QThread):
                     return
                 if not self._sleep_interruptibly(CYCLE_DELAY_S):
                     return
-        except (SerialLinkError, OSError, AuthError) as exc:
+        except AuthError as exc:
+            # Sorted here rather than in the window, because only the exception
+            # knows whether it describes a refusal or a transient.
+            if exc.retryable:
+                self.error.emit(str(exc))
+            else:
+                self.auth_failed.emit(str(exc))
+        except (SerialLinkError, OSError) as exc:
             # One clause, not two identical ones. SerialLink converts every
             # serial/OS failure to SerialLinkError before it reaches here, so
             # OSError is only reachable via a non-conforming link — worth

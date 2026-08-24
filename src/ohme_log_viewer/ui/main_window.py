@@ -7,13 +7,31 @@ buffer never parses and the reader never interprets.
 Streaming is always continuous, so there is no continuous-mode control: the
 reader loops from Connect to Disconnect and nothing can fall out of sync with
 it.
+
+The connection has three states, not two — Disconnected, Retrying and
+Streaming — because a device under development is absent or rebooting as often
+as it is present. Connect enters Retrying and attempts once a second; a session
+that fails returns there rather than ending. Only Disconnect, or a refusal that
+retrying could not fix, leaves for Disconnected. ``_is_trying`` is derived from
+the retry timer rather than tracked separately, so the flag and the state cannot
+disagree.
+
+File mode sits alongside those states rather than among them: a loaded file is
+an alternative *source*, feeding the same receive pipeline the reader does. The
+two sources are mutually exclusive — Open File is disabled while a session is
+live, and the connection controls are disabled while a file is open — so the
+pipeline never has to arbitrate between them. ``_is_file_mode`` is derived from
+the stored path for the same reason ``_is_trying`` is derived from the timer.
 """
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -28,11 +46,15 @@ from ..log_buffer import MAX_LINES, LogBuffer
 from ..log_line import LogLine, is_noise, parse
 from ..reader import LogReader
 from ..serial_link import SerialLink, SerialLinkError, list_usb_ports
+from ..version import __version__
 from .log_pane import LogPane
 from .tag_panel import TagPanel
 
 #: Display batching interval. A burst of lines costs one repaint, not one each.
 _FLUSH_INTERVAL_MS = 100
+
+#: Gap between connection attempts while retrying.
+_RETRY_INTERVAL_MS = 1000
 
 #: How long to wait for the reader thread to exit before giving up on it.
 #:
@@ -48,17 +70,22 @@ _READER_STOP_TIMEOUT_MS = 1500
 class MainWindow(QMainWindow):
     """Top-level window."""
 
-    def __init__(self, link_factory=SerialLink, authenticator_factory=DeviceAuthenticator) -> None:
+    def __init__(
+        self,
+        link_factory=SerialLink,
+        authenticator_factory=DeviceAuthenticator,
+        retry_interval_ms: int = _RETRY_INTERVAL_MS,
+    ) -> None:
         super().__init__()
-        self.setWindowTitle("Ohme Log Viewer")
+        self.setWindowTitle(f"Ohme Log Viewer v{__version__}")
         self.resize(1100, 700)
 
         # Both are per-connection, so they are factories rather than instances:
-        # see _connect for why neither may outlive its session.
+        # see _attempt for why neither may outlive its session.
         self._link_factory = link_factory
         self._authenticator_factory = authenticator_factory
 
-        # One link per connection, created in _connect. Never a long-lived
+        # One link per connection, created in _attempt. Never a long-lived
         # instance shared between sessions: a reader that outlives its session
         # would otherwise be holding the very object the next session opens.
         self._link: SerialLink | None = None
@@ -68,9 +95,23 @@ class MainWindow(QMainWindow):
         self._rerender_pending = False
         self._received = 0
         self._last_error: str | None = None
+        # Path of the loaded log file, or None outside file mode. File and
+        # board are exclusive sources: while this is set, connecting is
+        # disabled, and while a session is live, opening a file is.
+        self._file_path: str | None = None
+        self._attempts = 0
         # Readers that would not stop. Held so neither Qt nor Python frees a
         # thread object while its OS thread is still running.
         self._orphaned_readers: list[LogReader] = []
+
+        # Single-shot rather than repeating: each attempt arms the next one only
+        # if it failed, so a timer that is armed always means "an attempt is
+        # pending" and never fires into an established session. Built before the
+        # UI, because _update_status reads it to describe the current state.
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.setInterval(retry_interval_ms)
+        self._retry_timer.timeout.connect(self._attempt)
 
         self._build_ui()
         self._refresh_ports()
@@ -90,6 +131,7 @@ class MainWindow(QMainWindow):
 
         self._tag_panel = TagPanel()
         self._tag_panel.tag_toggled.connect(self._on_tag_toggled)
+        self._tag_panel.tags_refresh_requested.connect(self._on_tags_refresh_requested)
 
         # Same cap for both, so the view and the buffer never disagree about
         # which lines still exist.
@@ -123,6 +165,10 @@ class MainWindow(QMainWindow):
         self._connect_btn.clicked.connect(self._on_connect_clicked)
         bar.addWidget(self._connect_btn)
 
+        self._open_file_btn = QPushButton("Open File…")
+        self._open_file_btn.clicked.connect(self._on_open_file_clicked)
+        bar.addWidget(self._open_file_btn)
+
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.clicked.connect(self._on_clear_clicked)
         bar.addWidget(self._clear_btn)
@@ -143,33 +189,59 @@ class MainWindow(QMainWindow):
     def _is_streaming(self) -> bool:
         return self._reader is not None
 
-    def _on_connect_clicked(self) -> None:
-        if self._is_streaming:
-            self._disconnect()
-        else:
-            self._connect()
+    @property
+    def _is_trying(self) -> bool:
+        """True while an attempt is pending, i.e. between failures."""
+        return self._retry_timer.isActive()
 
-    def _connect(self) -> None:
-        device = self._port_combo.currentData()
-        if device is None:
+    def _on_connect_clicked(self) -> None:
+        if self._is_streaming or self._is_trying:
+            self._stop()
+        else:
+            self._start()
+
+    def _start(self) -> None:
+        """Begin a session, retrying every interval until the port opens."""
+        if self._port_combo.currentData() is None:
             # Via _report_error, not showMessage: the flush timer rewrites the
             # status text every 100 ms and would erase it before it was read.
+            # Not retried — no port is selected to retry against.
             self._report_error("No serial port selected")
             return
 
-        # A fresh link per connection. If a previous reader had to be parked it
-        # still holds the *previous* link, which _disconnect closed, so it can
-        # neither read this session's port nor write its own extract_logs to
-        # it — and it cannot race this session on a shared receive buffer.
+        self._attempts = 0
+        self._last_error = None
+        # Held so the button reads Disconnect from the first attempt onwards:
+        # the user asked for one control that stops whatever is going on, and
+        # for that the retrying state has to look like a session in progress.
+        self._set_busy_ui(True)
+        self._attempt()
+
+    def _attempt(self) -> None:
+        """One connection attempt. Arms the next if this one fails."""
+        device = self._port_combo.currentData()
+        if device is None:
+            # The combo cannot change while busy, so this means the port list
+            # was rebuilt under us. Nothing to attempt.
+            self._stop()
+            return
+
+        self._attempts += 1
+
+        # A fresh link per attempt. If a previous reader had to be parked it
+        # still holds the *previous* link, which was closed, so it can neither
+        # read this session's port nor write its own extract_logs to it — and it
+        # cannot race this session on a shared receive buffer.
         link = self._link_factory()
         try:
             link.open(device)
         except SerialLinkError as exc:
-            self._report_error(f"Could not open {device}: {exc}")
+            self._report_once(f"Could not open {device}: {exc}")
+            self._retry_timer.start()
+            self._update_status()
             return
 
         self._link = link
-        self._last_error = None
 
         # A fresh authenticator too. It caches the charger ID it was told and
         # the token it fetched, both of which belong to the device that was
@@ -177,15 +249,27 @@ class MainWindow(QMainWindow):
         self._reader = LogReader(link, authenticator=self._authenticator_factory())
         self._reader.line_received.connect(self._on_line_received)
         self._reader.error.connect(self._on_reader_error)
+        self._reader.auth_failed.connect(self._on_auth_failed)
         self._reader.finished.connect(self._on_reader_finished)
         self._reader.start()
-
-        self._connect_btn.setText("Disconnect")
-        self._port_combo.setEnabled(False)
-        self._refresh_btn.setEnabled(False)
         self._update_status()
 
-    def _disconnect(self) -> None:
+    def _stop(self) -> None:
+        """Stop streaming and stop retrying. The only way out of both."""
+        self._retry_timer.stop()
+        self._teardown()
+        self._set_busy_ui(False)
+        self._update_status()
+
+    def _set_busy_ui(self, busy: bool) -> None:
+        self._connect_btn.setText("Disconnect" if busy else "Connect")
+        self._port_combo.setEnabled(not busy)
+        self._refresh_btn.setEnabled(not busy)
+        # The board and a file are exclusive sources, so a live session locks
+        # out Open File just as file mode locks out Connect.
+        self._open_file_btn.setEnabled(not busy)
+
+    def _teardown(self) -> None:
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.stop()
@@ -200,10 +284,11 @@ class MainWindow(QMainWindow):
                 #
                 # Cut its signals first. A parked reader is still running and
                 # will emit whenever it unblocks; left connected it would push
-                # lines into the buffer, or trigger a second _disconnect, long
+                # lines into the buffer, or trigger a second teardown, long
                 # after the UI said "Disconnected". Parked means inert.
                 reader.line_received.disconnect(self._on_line_received)
                 reader.error.disconnect(self._on_reader_error)
+                reader.auth_failed.disconnect(self._on_auth_failed)
                 reader.finished.disconnect(self._on_reader_finished)
                 self._orphaned_readers.append(reader)
                 self._report_error(
@@ -217,16 +302,22 @@ class MainWindow(QMainWindow):
         if link is not None:
             link.close()
 
-        self._connect_btn.setText("Connect")
-        self._port_combo.setEnabled(True)
-        self._refresh_btn.setEnabled(True)
+    def _on_reader_error(self, message: str) -> None:
+        """A failure worth another attempt: tear down and go back to trying.
+
+        The buffer survives, so what was captured before the failure stays
+        readable and filterable — a device that reboots mid-diagnosis does not
+        cost you the log that led up to it.
+        """
+        self._report_once(message)
+        self._teardown()
+        self._retry_timer.start()
         self._update_status()
 
-    def _on_reader_error(self, message: str) -> None:
-        # The buffer survives, so what was captured before the failure stays
-        # readable and filterable.
+    def _on_auth_failed(self, message: str) -> None:
+        """A refusal: stop. Retrying it would only repeat the refusal."""
         self._report_error(message)
-        self._disconnect()
+        self._stop()
 
     def _report_error(self, message: str) -> None:
         """Show *message* in the pane and keep it in the status bar.
@@ -239,9 +330,95 @@ class MainWindow(QMainWindow):
         self._pane.append_error(message)
         self._update_status()
 
+    def _report_once(self, message: str) -> None:
+        """Report *message* unless it is the one already showing.
+
+        A missing port fails identically every second. Reported unconditionally
+        that is a line of pane per second, burying whatever preceded it; the
+        status bar carries the attempt count instead, so nothing is lost by
+        staying quiet about the repeat.
+        """
+        if message == self._last_error:
+            return
+        self._report_error(message)
+
     def _on_reader_finished(self) -> None:
+        # Only reached without a preceding error signal when the reader stopped
+        # on its own, which means it was interrupted — and the only interrupter
+        # is _stop, which has already torn everything down.
         if self._is_streaming:
-            self._disconnect()
+            self._teardown()
+            self._retry_timer.start()
+            self._update_status()
+
+    # ── file mode ────────────────────────────────────────────────────────
+
+    @property
+    def _is_file_mode(self) -> bool:
+        return self._file_path is not None
+
+    def _on_open_file_clicked(self) -> None:
+        if self._is_file_mode:
+            self._close_file()
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open log file",
+            "",
+            "Log files (*.txt *.log);;All files (*)",
+        )
+        if path:
+            self._load_file(path)
+
+    def _load_file(self, path: str) -> None:
+        """Show the contents of the log file at *path* instead of a device.
+
+        Read in full before the view is touched, so a file that cannot be
+        read costs an error message and nothing else — whatever was on
+        display stays on display.
+        """
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            self._report_error(f"Could not read {path}: {exc}")
+            return
+
+        self._reset_view()
+        for raw in lines:
+            self._on_line_received(raw)
+        self._file_path = path
+        self._set_file_mode_ui(True)
+        self._update_status()
+
+    def _close_file(self) -> None:
+        """Leave file mode: drop the file's lines and re-enable connecting."""
+        self._file_path = None
+        self._reset_view()
+        self._set_file_mode_ui(False)
+        self._update_status()
+
+    def _reset_view(self) -> None:
+        """Empty the view, the buffer and the tag list entirely.
+
+        Unlike Clear, tags do not survive: a file's tags describe the file,
+        not whatever source comes next.
+        """
+        self._buffer.clear()
+        self._buffer.refresh_tags()
+        self._tag_panel.reset()
+        self._pending.clear()
+        self._rerender_pending = False
+        self._pane.clear()
+        self._received = 0
+        self._last_error = None
+        self._sync_tags()
+
+    def _set_file_mode_ui(self, on: bool) -> None:
+        self._open_file_btn.setText("Close File" if on else "Open File…")
+        self._connect_btn.setEnabled(not on)
+        self._port_combo.setEnabled(not on)
+        self._refresh_btn.setEnabled(not on)
 
     # ── receive pipeline ─────────────────────────────────────────────────
 
@@ -288,6 +465,19 @@ class MainWindow(QMainWindow):
         self._buffer.set_tag_enabled(tag, on)
         self._rerender_pending = True
 
+    def _on_tags_refresh_requested(self) -> None:
+        """Rebuild the tag list from the lines currently held.
+
+        The buffer rediscovers its tags, the panel drops its rows so the next
+        flush rebuilds them, and the pane is re-rendered because every tag comes
+        back enabled — lines hidden by the old filter have to reappear.
+        """
+        self._buffer.refresh_tags()
+        self._tag_panel.reset()
+        self._rerender_pending = True
+        self._sync_tags()
+        self._update_status()
+
     def _on_clear_clicked(self) -> None:
         self._buffer.clear()
         self._pending.clear()
@@ -303,8 +493,12 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _update_status(self) -> None:
-        if self._is_streaming:
+        if self._is_file_mode:
+            state = f"Viewing file: {os.path.basename(self._file_path)}"
+        elif self._is_streaming:
             state = f"Streaming from {self._port_combo.currentData()}"
+        elif self._is_trying:
+            state = f"Retrying {self._port_combo.currentData()} " f"(attempt {self._attempts})"
         else:
             state = "Disconnected"
         # Read from the pane rather than counted here, so it stays exact across
@@ -322,5 +516,5 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """Stop the reader thread before the process exits."""
         self._flush_timer.stop()
-        self._disconnect()
+        self._stop()
         event.accept()
