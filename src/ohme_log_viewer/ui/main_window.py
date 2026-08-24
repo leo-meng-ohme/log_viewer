@@ -15,13 +15,23 @@ that fails returns there rather than ending. Only Disconnect, or a refusal that
 retrying could not fix, leaves for Disconnected. ``_is_trying`` is derived from
 the retry timer rather than tracked separately, so the flag and the state cannot
 disagree.
+
+File mode sits alongside those states rather than among them: a loaded file is
+an alternative *source*, feeding the same receive pipeline the reader does. The
+two sources are mutually exclusive — Open File is disabled while a session is
+live, and the connection controls are disabled while a file is open — so the
+pipeline never has to arbitrate between them. ``_is_file_mode`` is derived from
+the stored path for the same reason ``_is_trying`` is derived from the timer.
 """
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -85,6 +95,10 @@ class MainWindow(QMainWindow):
         self._rerender_pending = False
         self._received = 0
         self._last_error: str | None = None
+        # Path of the loaded log file, or None outside file mode. File and
+        # board are exclusive sources: while this is set, connecting is
+        # disabled, and while a session is live, opening a file is.
+        self._file_path: str | None = None
         self._attempts = 0
         # Readers that would not stop. Held so neither Qt nor Python frees a
         # thread object while its OS thread is still running.
@@ -150,6 +164,10 @@ class MainWindow(QMainWindow):
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.clicked.connect(self._on_connect_clicked)
         bar.addWidget(self._connect_btn)
+
+        self._open_file_btn = QPushButton("Open File…")
+        self._open_file_btn.clicked.connect(self._on_open_file_clicked)
+        bar.addWidget(self._open_file_btn)
 
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.clicked.connect(self._on_clear_clicked)
@@ -247,6 +265,9 @@ class MainWindow(QMainWindow):
         self._connect_btn.setText("Disconnect" if busy else "Connect")
         self._port_combo.setEnabled(not busy)
         self._refresh_btn.setEnabled(not busy)
+        # The board and a file are exclusive sources, so a live session locks
+        # out Open File just as file mode locks out Connect.
+        self._open_file_btn.setEnabled(not busy)
 
     def _teardown(self) -> None:
         reader, self._reader = self._reader, None
@@ -330,6 +351,75 @@ class MainWindow(QMainWindow):
             self._retry_timer.start()
             self._update_status()
 
+    # ── file mode ────────────────────────────────────────────────────────
+
+    @property
+    def _is_file_mode(self) -> bool:
+        return self._file_path is not None
+
+    def _on_open_file_clicked(self) -> None:
+        if self._is_file_mode:
+            self._close_file()
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open log file",
+            "",
+            "Log files (*.txt *.log);;All files (*)",
+        )
+        if path:
+            self._load_file(path)
+
+    def _load_file(self, path: str) -> None:
+        """Show the contents of the log file at *path* instead of a device.
+
+        Read in full before the view is touched, so a file that cannot be
+        read costs an error message and nothing else — whatever was on
+        display stays on display.
+        """
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            self._report_error(f"Could not read {path}: {exc}")
+            return
+
+        self._reset_view()
+        for raw in lines:
+            self._on_line_received(raw)
+        self._file_path = path
+        self._set_file_mode_ui(True)
+        self._update_status()
+
+    def _close_file(self) -> None:
+        """Leave file mode: drop the file's lines and re-enable connecting."""
+        self._file_path = None
+        self._reset_view()
+        self._set_file_mode_ui(False)
+        self._update_status()
+
+    def _reset_view(self) -> None:
+        """Empty the view, the buffer and the tag list entirely.
+
+        Unlike Clear, tags do not survive: a file's tags describe the file,
+        not whatever source comes next.
+        """
+        self._buffer.clear()
+        self._buffer.refresh_tags()
+        self._tag_panel.reset()
+        self._pending.clear()
+        self._rerender_pending = False
+        self._pane.clear()
+        self._received = 0
+        self._last_error = None
+        self._sync_tags()
+
+    def _set_file_mode_ui(self, on: bool) -> None:
+        self._open_file_btn.setText("Close File" if on else "Open File…")
+        self._connect_btn.setEnabled(not on)
+        self._port_combo.setEnabled(not on)
+        self._refresh_btn.setEnabled(not on)
+
     # ── receive pipeline ─────────────────────────────────────────────────
 
     def _on_line_received(self, raw: str) -> None:
@@ -403,7 +493,9 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _update_status(self) -> None:
-        if self._is_streaming:
+        if self._is_file_mode:
+            state = f"Viewing file: {os.path.basename(self._file_path)}"
+        elif self._is_streaming:
             state = f"Streaming from {self._port_combo.currentData()}"
         elif self._is_trying:
             state = f"Retrying {self._port_combo.currentData()} " f"(attempt {self._attempts})"

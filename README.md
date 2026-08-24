@@ -104,6 +104,14 @@ with that reason in the status bar rather than a silent stall.
   and the whole selection follows. Space does the same. The selection survives,
   so the same group can be flipped back without picking it out again. A tag you
   have not selected still toggles on its own, as before.
+- **Open File…** — views a saved log file instead of a live device. The file's
+  lines go through the same parser as streamed ones, so colours, tags, counts
+  and filtering all work identically, `(unparsed)` included. File and board are
+  exclusive sources: while a file is open, Connect, the port dropdown and
+  Refresh are disabled, and while a session is streaming or retrying, Open
+  File is. The button becomes **Close File**, which drops the file's lines and
+  tags and returns to the normal disconnected state. A file that cannot be
+  read costs an error message and nothing else — whatever was on display stays.
 - **Clear** — empties the view and the buffer but keeps your tag list and
   check states, so clearing before a test run does not cost you the filter
   setup.
@@ -136,5 +144,6 @@ link and authenticator a connection is given — by injecting both, and follows 
 tag filter change from the panel through to the lines left in view.
 `tests/test_tag_panel.py` drives the real tag list with `QTest` clicks and
 keystrokes, so the multi-select behaviour is checked against Qt itself rather
-than a stub. What remains for the on-device smoke test is the parts only a real
+than a stub. `tests/test_file_mode.py` covers viewing a saved log file: what a
+loaded file leaves in view, and that file and board lock each other out. What remains for the on-device smoke test is the parts only a real
 device exercises: the authenticated handshake and a live extraction.
