@@ -9,15 +9,34 @@ code with the `devcli-gui` log viewer in `firmware-hq/ohme_fw_cli`.
 
 ## Install
 
+Requires Python 3.11+.
+
+macOS / Linux:
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
+Windows:
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\pip install -e ".[dev]"
+```
+
 ## Run
+
+macOS / Linux:
 
 ```bash
 .venv/bin/ohme-log-viewer
+```
+
+Windows:
+
+```bat
+.venv\Scripts\ohme-log-viewer
 ```
 
 Pick the device's USB serial port from the dropdown and press **Connect**.
