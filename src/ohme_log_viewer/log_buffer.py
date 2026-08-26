@@ -94,6 +94,15 @@ class LogBuffer:
         if tag in self._enabled:
             self._enabled[tag] = on
 
+    def lines(self) -> Iterator[LogLine]:
+        """Yield every stored line, oldest first, ignoring the tag filter.
+
+        The unfiltered sibling of :meth:`visible`: saving a capture must be
+        complete, and the filter is a viewing aid rather than a statement of
+        what exists.
+        """
+        yield from self._lines
+
     def visible(self) -> Iterator[LogLine]:
         """Yield stored lines whose tag is enabled, oldest first."""
         for stored in self._lines:

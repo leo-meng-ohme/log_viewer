@@ -131,6 +131,12 @@ with that reason in the status bar rather than a silent stall.
   File is. The button becomes **Close File**, which drops the file's lines and
   tags and returns to the normal disconnected state. A file that cannot be
   read costs an error message and nothing else — whatever was on display stays.
+- **Save Logs…** — writes everything currently in the buffer to a file of
+  your choosing: every line's original text, all tags whether ticked or not,
+  oldest first. Because it saves the raw lines, opening the file later with
+  **Open File…** reproduces the same tags, counts and colours. Available in
+  every state, since it only reads the buffer — but remember only the last
+  50,000 lines are held, so save before a long session outruns the cap.
 - **Clear** — empties the view and the buffer but keeps your tag list and
   check states, so clearing before a test run does not cost you the filter
   setup.

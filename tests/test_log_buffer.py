@@ -91,6 +91,14 @@ def test_setting_an_unknown_tag_is_ignored():
     assert buffer.tags() == []
 
 
+def test_lines_yields_everything_stored_ignoring_the_filter():
+    buffer = LogBuffer()
+    buffer.append(line("MODEM", "one"))
+    buffer.append(line("OCPP", "two"))
+    buffer.set_tag_enabled("MODEM", False)
+    assert [item.message for item in buffer.lines()] == ["one", "two"]
+
+
 # ── refreshing the tag list ──────────────────────────────────────────────
 
 

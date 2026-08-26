@@ -27,6 +27,7 @@ the stored path for the same reason ``_is_trying`` is derived from the timer.
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -172,6 +173,10 @@ class MainWindow(QMainWindow):
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.clicked.connect(self._on_clear_clicked)
         bar.addWidget(self._clear_btn)
+
+        self._save_btn = QPushButton("Save Logs…")
+        self._save_btn.clicked.connect(self._on_save_clicked)
+        bar.addWidget(self._save_btn)
 
     def _refresh_ports(self) -> None:
         previous = self._port_combo.currentData()
@@ -419,6 +424,51 @@ class MainWindow(QMainWindow):
         self._connect_btn.setEnabled(not on)
         self._port_combo.setEnabled(not on)
         self._refresh_btn.setEnabled(not on)
+
+    # ── saving ───────────────────────────────────────────────────────────
+
+    def _on_save_clicked(self) -> None:
+        """Snapshot the buffer to a file of the user's choosing.
+
+        Available in every state — streaming, retrying, file mode or
+        disconnected — because it only reads the buffer. Checked for emptiness
+        before the dialog, so an empty session costs a message rather than a
+        pointless save prompt.
+        """
+        if self._buffer.total() == 0:
+            self._report_error("No lines to save")
+            return
+        # Aware-then-local rather than a bare now(): same wall-clock result,
+        # but it cannot be mistaken for a UTC timestamp when read back.
+        stamp = datetime.now(UTC).astimezone()
+        default_name = f"ohme-logs-{stamp:%Y%m%d-%H%M%S}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save logs",
+            default_name,
+            "Log files (*.txt *.log);;All files (*)",
+        )
+        if path:
+            self._save_to(path)
+
+    def _save_to(self, path: str) -> None:
+        """Write every buffered line — all tags, filtered or not — to *path*.
+
+        Lines are written as their original text, so the file round-trips
+        through Open File and its parser unchanged.
+        """
+        count = 0
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                for line in self._buffer.lines():
+                    fh.write(line.raw + "\n")
+                    count += 1
+        except OSError as exc:
+            self._report_error(f"Could not save to {path}: {exc}")
+            return
+        # Via the pane rather than the status bar: _update_status rewrites the
+        # status text on every 100 ms flush and would erase the confirmation.
+        self._pane.append_notice(f"[saved {count} lines to {path}]")
 
     # ── receive pipeline ─────────────────────────────────────────────────
 

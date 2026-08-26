@@ -95,6 +95,15 @@ class LogPane(QWidget):
         if follow:
             self._scroll_to_bottom()
 
+    def append_notice(self, message: str) -> None:
+        """Append an internal notice, verbatim, in the neutral info colour."""
+        follow = self._is_at_bottom()
+        cursor = self._view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._insert(cursor, message, _LEVEL_COLOURS["I"])
+        if follow:
+            self._scroll_to_bottom()
+
     def clear(self) -> None:
         self._view.clear()
 
