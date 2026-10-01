@@ -307,3 +307,44 @@ def test_the_list_rebuilds_after_a_reset(panel):
     widget.reset()
     widget.sync(["RCD", "MODEM"], {"RCD": 1, "MODEM": 1}, {"RCD": True, "MODEM": True})
     assert rows(panel) == ["MODEM", "RCD"]
+
+
+# ── the check indicators are actually painted ────────────────────────────
+
+
+def indicator_colours(widget, tag):
+    """Distinct colours painted in the check-indicator band of *tag*'s row.
+
+    Samples the strip to the left of the text, where every style puts the
+    indicator. A row that painted one shows several colours — its border, its
+    fill, its antialiasing. A row that painted nothing shows exactly one: the
+    background.
+    """
+    image = widget.grab().toImage()
+    ratio = widget.grab().devicePixelRatio()
+    row = widget._list.visualItemRect(widget._items[tag])
+    origin = widget._list.viewport().mapTo(widget, row.topLeft())
+    return {
+        image.pixelColor(int(x * ratio), int(y * ratio)).name()
+        for y in range(origin.y() + 2, origin.y() + row.height() - 2)
+        for x in range(origin.x() + 2, origin.x() + 22)
+    }
+
+
+def test_every_row_paints_its_check_indicator(qapp):
+    """Qt's native macOS style paints only the first row's indicator.
+
+    Left on that style the panel is unusable: the check state is correct in
+    the model but invisible on screen from the second tag down, so there is
+    nothing to aim a click at and no way to read the filter. Asserted by
+    inspecting pixels because the defect is purely in the painting — every
+    other test here passes with the indicators missing.
+    """
+    widget = TagPanel()
+    widget.sync(TAGS, {tag: 1 for tag in TAGS}, {tag: True for tag in TAGS})
+    widget.resize(200, 300)
+    widget.show()
+    QApplication.processEvents()
+
+    unpainted = [tag for tag in TAGS if len(indicator_colours(widget, tag)) < 2]
+    assert unpainted == []

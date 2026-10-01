@@ -488,7 +488,11 @@ class MainWindow(QMainWindow):
             self._pane.render(self._buffer.visible())
             self._rerender_pending = False
         elif self._pending:
-            self._pane.append_lines(self._pending)
+            # A tag wider than the aligned column shifts every timestamp, so
+            # the pane declines the batch and the whole view is redrawn — the
+            # batch is already in the buffer and comes back with it.
+            if not self._pane.append_lines(self._pending):
+                self._pane.render(self._buffer.visible())
             self._pending.clear()
         self._sync_tags()
         self._update_status()

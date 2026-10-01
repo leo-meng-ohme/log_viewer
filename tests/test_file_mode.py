@@ -146,3 +146,18 @@ def test_opening_a_file_is_disabled_while_a_session_is_live(qapp):
         assert window._open_file_btn.isEnabled()
     finally:
         window.close()
+
+
+def test_a_wider_tag_arriving_later_realigns_the_lines_already_shown(qapp):
+    window = window_with_fake_port(qapp)
+    try:
+        window._on_line_received("I/OTA [t] first")
+        window._flush()
+        window._on_line_received("W/WIFI_MGR [t] second")
+        window._flush()
+        assert window._pane._view.toPlainText().splitlines() == [
+            "I/OTA      [t] first",
+            "W/WIFI_MGR [t] second",
+        ]
+    finally:
+        window.close()

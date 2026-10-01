@@ -5,6 +5,11 @@ block cap is set from the same number as the buffer's ring cap. Leaving it
 uncapped would let the view keep every line ever received while the buffer
 evicted at 50,000, so the two would silently disagree about what exists and the
 view's memory would grow without bound on a long session.
+
+Lines are displayed with their tag padded to the widest tag on display, so every
+timestamp starts in the same column. Tags have no fixed width on the wire, which
+leaves the raw text ragged. This is presentation only: ``LogLine.raw`` is never
+altered, so saved files remain exactly what the device sent.
 """
 
 from __future__ import annotations
@@ -46,12 +51,30 @@ _ERROR_COLOUR = "#f14c4c"
 _AT_BOTTOM_SLACK = 0
 
 
+def format_line(line: LogLine, tag_width: int) -> str:
+    """Return *line* as displayed, its tag padded out to *tag_width*.
+
+    A tag wider than *tag_width* is written in full, never truncated. A line
+    that did not parse has no columns to align and is returned unchanged.
+    """
+    if line.level is None or line.tag is None:
+        return line.raw
+    source = f"({line.source}) " if line.source is not None else ""
+    return f"{line.level}/{line.tag:<{tag_width}} [{line.timestamp}] {source}{line.message}"
+
+
+def _tag_width(line: LogLine) -> int:
+    return len(line.tag) if line.level is not None and line.tag is not None else 0
+
+
 class LogPane(QWidget):
     """Scrollable coloured log output."""
 
     def __init__(self, max_lines: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._max_lines = max_lines
+        #: Widest tag on display — the column every timestamp is aligned to.
+        self._tag_width = 0
         self._build_ui()
 
     # ── public API ───────────────────────────────────────────────────────
@@ -66,23 +89,28 @@ class LogPane(QWidget):
         """
         return self._view.blockCount() - 1
 
-    def append_lines(self, lines: Sequence[LogLine]) -> None:
-        """Append a batch of lines in one repaint."""
-        if not lines:
-            return
-        follow = self._is_at_bottom()
-        cursor = self._view.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        for line in lines:
-            self._insert(cursor, self._text_for(line), self._colour_for(line))
-        if follow:
-            self._scroll_to_bottom()
+    def append_lines(self, lines: Sequence[LogLine]) -> bool:
+        """Append a batch of lines in one repaint.
+
+        Returns False, appending nothing, if the batch holds a tag wider than
+        the current column: the lines already shown would be misaligned, so the
+        caller must :meth:`render` everything instead. An empty pane has
+        nothing to misalign, so it simply widens.
+        """
+        widest = max(map(_tag_width, lines), default=0)
+        if widest > self._tag_width:
+            if self.line_count() > 0:
+                return False
+            self._tag_width = widest
+        self._append(lines)
+        return True
 
     def render(self, lines: Iterable[LogLine]) -> int:
         """Replace the contents with *lines*. Returns how many were rendered."""
         materialised = list(lines)
-        self._view.clear()
-        self.append_lines(materialised)
+        self.clear()
+        self._tag_width = max(map(_tag_width, materialised), default=0)
+        self._append(materialised)
         self._scroll_to_bottom()
         return len(materialised)
 
@@ -106,8 +134,20 @@ class LogPane(QWidget):
 
     def clear(self) -> None:
         self._view.clear()
+        self._tag_width = 0
 
     # ── internals ────────────────────────────────────────────────────────
+
+    def _append(self, lines: Sequence[LogLine]) -> None:
+        if not lines:
+            return
+        follow = self._is_at_bottom()
+        cursor = self._view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        for line in lines:
+            self._insert(cursor, format_line(line, self._tag_width), self._colour_for(line))
+        if follow:
+            self._scroll_to_bottom()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -131,10 +171,6 @@ class LogPane(QWidget):
             f" border: 1px solid {_BORDER}; color: {_LEVEL_COLOURS['I']}; }}"
         )
         layout.addWidget(self._view)
-
-    @staticmethod
-    def _text_for(line: LogLine) -> str:
-        return line.raw
 
     @staticmethod
     def _colour_for(line: LogLine) -> str:

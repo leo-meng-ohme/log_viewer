@@ -21,11 +21,13 @@ from collections.abc import Sequence
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QStyleFactory,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +39,10 @@ _PANEL_WIDTH_PX = 200
 #: Item data role holding the full, unelided tag.
 _TAG_ROLE = Qt.ItemDataRole.UserRole
 
+#: Style put on the list where the platform's own cannot draw a check
+#: indicator on every row. See :func:`_repair_check_indicators`.
+_FALLBACK_STYLE = "Fusion"
+
 
 def _sort_key(tag: str) -> tuple[bool, str]:
     """Order tags alphabetically, with the unparsed group always last.
@@ -47,6 +53,35 @@ def _sort_key(tag: str) -> tuple[bool, str]:
     catch-all for lines that did not parse, not a tag the device emitted.
     """
     return (tag == UNPARSED_TAG, tag.casefold())
+
+
+def _repair_check_indicators(view: QListWidget) -> None:
+    """Give *view* a style that can draw a check indicator on every row.
+
+    Qt's native macOS style — 6.11.2 on macOS 26 — paints the indicator of the
+    first row only. Every other row reserves the space and draws nothing, so
+    from the second tag down there is no tick to read the filter from and
+    nothing to aim a click at. The check states themselves are correct: this
+    is painting alone, it happens whatever the states are, and no repaint,
+    scroll or reinsertion brings the missing indicators back. Four checked
+    rows in a bare ``QListWidget`` reproduce it, so there is nothing in this
+    panel to fix.
+
+    Fusion draws all of them, and is installed on the list alone so the
+    buttons and the rest of the window stay native. Chosen by style rather
+    than by platform: a session already launched with ``-style Fusion`` needs
+    nothing, and neither does Windows.
+    """
+    if QApplication.style().objectName() != "macos":
+        return
+    style = QStyleFactory.create(_FALLBACK_STYLE)
+    if style is None:  # Not built into this Qt — leave the native style be.
+        return
+    # Parented so Qt owns it. setStyle does not take ownership, and a style
+    # left to Python would be collected, leaving the view painting through a
+    # dangling pointer.
+    style.setParent(view)
+    view.setStyle(style)
 
 
 class TagPanel(QWidget):
@@ -166,6 +201,7 @@ class TagPanel(QWidget):
         layout.addWidget(QLabel("Tags"))
 
         self._list = QListWidget()
+        _repair_check_indicators(self._list)
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         # The only affordance the gesture has. Set on the list rather than each
         # row, whose tooltip carries its own unelided tag name.
