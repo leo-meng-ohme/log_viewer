@@ -388,3 +388,30 @@ def test_refreshing_tags_brings_hidden_lines_back(qapp):
         ), "MODEM did not come back ticked"
     finally:
         window.close()
+
+
+# ── command box ──────────────────────────────────────────────────────────
+
+
+def test_the_command_box_is_disabled_until_a_session_streams(qapp):
+    window = MainWindow(link_factory=FakeLink, authenticator_factory=StubAuthenticator)
+    try:
+        assert not window._command_input.isEnabled()
+    finally:
+        window.close()
+
+
+def test_an_entered_command_reaches_the_device_and_is_echoed(qapp):
+    link = FakeLink(["I/MODEM [t] hello", MARKER])
+    window = connected(qapp, link, StubAuthenticator())
+    try:
+        assert pump_until(qapp, window._command_input.isEnabled), "box never enabled"
+        window._command_input.setText("get_cli_status")
+        window._command_input.returnPressed.emit()
+
+        assert pump_until(qapp, lambda: "get_cli_status" in link.written), link.written
+        assert pump_until(qapp, lambda: "> get_cli_status" in raw_lines(window)), raw_lines(window)
+    finally:
+        window.close()
+
+    assert not window._command_input.isEnabled()

@@ -7,4 +7,4 @@ distribution can never disagree about which version is running.
 
 from __future__ import annotations
 
-__version__ = "1.8"
+__version__ = "2.0"

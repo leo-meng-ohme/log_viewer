@@ -24,7 +24,7 @@ from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QApplication
 
 from ohme_log_viewer.auth import AuthError
-from ohme_log_viewer.reader import COMMAND, MARKER, LogReader
+from ohme_log_viewer.reader import COMMAND, COMMAND_ECHO_PREFIX, MARKER, LogReader
 from ohme_log_viewer.serial_link import SerialLinkError
 
 AUTH_REQUIRED = json.dumps({"result": "auth_required", "challenge": "a3f1c8" + "00" * 13})
@@ -263,3 +263,39 @@ def test_no_lines_are_emitted_after_the_signal_is_disconnected(qapp):
         assert not pump_until(qapp, lambda: "after" in collector.lines, timeout_s=0.2)
 
     assert collector.lines == ["before"]
+
+
+# ── user commands ────────────────────────────────────────────────────────
+
+
+def test_a_user_command_is_sent_after_the_cycle_and_its_reply_emitted(qapp):
+    link = FakeLink(["log line", MARKER])
+    reader = LogReader(link)
+    collector = Collector()
+    reader.line_received.connect(collector.on_line)
+
+    with running(reader):
+        reader.send_command("get_cli_status")
+        assert pump_until(qapp, lambda: "get_cli_status" in link.written), link.written
+        link.feed('{"result":"ok"}')
+        assert pump_until(qapp, lambda: '{"result":"ok"}' in collector.lines), collector.lines
+
+    # Never interleaved with an extraction: written only once the marker ended it.
+    assert link.written[:2] == [COMMAND, "get_cli_status"]
+    echo = COMMAND_ECHO_PREFIX + "get_cli_status"
+    assert collector.lines.index(echo) < collector.lines.index('{"result":"ok"}')
+
+
+def test_a_reply_during_the_gap_arrives_before_the_next_cycle(qapp):
+    # The gap reads rather than sleeps, so a reply is not held for a whole
+    # cycle delay. Only one extract_logs has been written when it shows up.
+    link = FakeLink([MARKER])
+    reader = LogReader(link)
+    collector = Collector()
+    reader.line_received.connect(collector.on_line)
+
+    with running(reader):
+        assert pump_until(qapp, link.drained), "first cycle never completed"
+        link.feed("reply")
+        assert pump_until(qapp, lambda: "reply" in collector.lines, timeout_s=0.5)
+        assert link.written.count(COMMAND) == 1

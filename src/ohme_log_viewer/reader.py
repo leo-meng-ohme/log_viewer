@@ -12,6 +12,12 @@ is enough. There is no per-cycle thread to create and destroy, and therefore
 none of the lifecycle hazard that comes with tearing a QThread down every
 second.
 
+Commands typed by the user are sent from this same thread, in the gap between
+cycles: the thread owns the port, and a command written mid-extraction would
+interleave its reply with the log payload. The gap is spent reading rather than
+sleeping, so a reply appears as soon as the device sends it instead of waiting
+for the next cycle.
+
 Marker detection runs before any noise filtering, so hiding the sentinel from
 the display cannot desynchronise the TX/RX cycle. It does normalise the line
 first: the previous chunk's NUL padding runs into the sentinel with no newline
@@ -26,6 +32,7 @@ output — see :mod:`ohme_log_viewer.auth`.
 
 from __future__ import annotations
 
+import queue
 import time
 from collections.abc import Callable
 
@@ -56,8 +63,8 @@ CYCLE_TIMEOUT_S = 120.0
 #: exactly like streaming while producing nothing.
 MAX_AUTH_ATTEMPTS = 2
 
-#: Granularity of interruptible sleeping.
-_SLEEP_SLICE_S = 0.05
+#: Prefix that marks a user command echoed into the log, like a shell prompt.
+COMMAND_ECHO_PREFIX = "> "
 
 
 class CycleTimeout(SerialLinkError):
@@ -144,10 +151,19 @@ class LogReader(QThread):
         super().__init__(parent)
         self._link = link
         self._authenticator = authenticator
+        # Filled from the GUI thread, drained from this one.
+        self._commands: queue.SimpleQueue[str] = queue.SimpleQueue()
 
     def stop(self) -> None:
         """Ask the loop to finish. Detected within one read timeout."""
         self.requestInterruption()
+
+    def send_command(self, text: str) -> None:
+        """Queue *text* for the device. Sent in the next gap between cycles.
+
+        Safe to call from any thread.
+        """
+        self._commands.put(text)
 
     def run(self) -> None:  # QThread entry point; Qt calls this, we never do
         try:
@@ -160,7 +176,7 @@ class LogReader(QThread):
                 )
                 if not completed:
                     return
-                if not self._sleep_interruptibly(CYCLE_DELAY_S):
+                if not self._idle(CYCLE_DELAY_S):
                     return
         except AuthError as exc:
             # Sorted here rather than in the window, because only the exception
@@ -176,13 +192,29 @@ class LogReader(QThread):
             # catching, not worth a duplicated body.
             self.error.emit(str(exc))
 
-    def _sleep_interruptibly(self, seconds: float) -> bool:
-        """Sleep in short slices. Returns False if interrupted partway."""
-        remaining = seconds
-        while remaining > 0:
+    def _idle(self, seconds: float) -> bool:
+        """Spend the gap between cycles sending queued commands and reading.
+
+        Returns False if interrupted partway. Each read is bounded by the link's
+        timeout, so interruption is still noticed promptly.
+        """
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
             if self.isInterruptionRequested():
                 return False
-            slice_s = min(_SLEEP_SLICE_S, remaining)
-            self.msleep(int(slice_s * 1000))
-            remaining -= slice_s
+            self._send_queued_commands()
+            line = self._link.read_line()
+            if line is not None:
+                self.line_received.emit(line)
         return True
+
+    def _send_queued_commands(self) -> None:
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            # Echoed through the same signal as device output, so it lands in
+            # order with its reply and is kept by Save Logs.
+            self.line_received.emit(COMMAND_ECHO_PREFIX + command)
+            self._link.write_line(command)

@@ -137,6 +137,13 @@ with that reason in the status bar rather than a silent stall.
   **Open File…** reproduces the same tags, counts and colours. Available in
   every state, since it only reads the buffer — but remember only the last
   50,000 lines are held, so save before a long session outruns the cap.
+- **CLI commands** — the box under the log sends any CLI command to the
+  connected device. Press Enter to send it; ↑/↓ step through the commands
+  you have already sent. The command shows up in the log as `> command`, and
+  the device's reply comes after it, so both are kept by **Save Logs…**. The
+  command is sent in the one-second gap between `extract_logs` cycles, never
+  during one, so its reply is never mixed into a log extraction. You can only
+  type in the box while streaming.
 - **Clear** — empties the view and the buffer but keeps your tag list and
   check states, so clearing before a test run does not cost you the filter
   setup.
@@ -167,6 +174,7 @@ connections against a fake link, with Qt on its offscreen platform.
 `tests/test_main_window.py` covers what the window decides per session — which
 link and authenticator a connection is given — by injecting both, and follows one
 tag filter change from the panel through to the lines left in view.
+`tests/test_command_input.py` covers the command box and its history.
 `tests/test_tag_panel.py` drives the real tag list with `QTest` clicks and
 keystrokes, so the multi-select behaviour is checked against Qt itself rather
 than a stub. `tests/test_file_mode.py` covers viewing a saved log file: what a

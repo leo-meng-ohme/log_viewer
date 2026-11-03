@@ -22,6 +22,10 @@ two sources are mutually exclusive — Open File is disabled while a session is
 live, and the connection controls are disabled while a file is open — so the
 pipeline never has to arbitrate between them. ``_is_file_mode`` is derived from
 the stored path for the same reason ``_is_trying`` is derived from the timer.
+
+The command box under the log is enabled only while streaming, since a command
+needs a live reader to carry it to the device. Its echo and the device's reply
+come back through the same receive pipeline as the logs.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -48,6 +53,7 @@ from ..log_line import LogLine, is_noise, parse
 from ..reader import LogReader
 from ..serial_link import SerialLink, SerialLinkError, list_usb_ports
 from ..version import __version__
+from .command_input import CommandInput
 from .log_pane import LogPane
 from .tag_panel import TagPanel
 
@@ -62,8 +68,8 @@ _RETRY_INTERVAL_MS = 1000
 #: This blocks the GUI thread, so it is sized to the reader's own worst case
 #: rather than picked for comfort. Every operation the loop performs is
 #: bounded: a read is capped at the link's 0.3 s timeout, and the inter-cycle
-#: wait is 50 ms slices that check for interruption between each. A reader
-#: that is going to stop at all has therefore stopped well inside 1.5 s;
+#: gap is made of those same reads, checking for interruption between each. A
+#: reader that is going to stop at all has therefore stopped well inside 1.5 s;
 #: anything slower is pathological and waiting longer will not rescue it.
 _READER_STOP_TIMEOUT_MS = 1500
 
@@ -138,9 +144,18 @@ class MainWindow(QMainWindow):
         # which lines still exist.
         self._pane = LogPane(max_lines=MAX_LINES)
 
+        self._command_input = CommandInput()
+        self._command_input.command_entered.connect(self._on_command_entered)
+
+        log_column = QWidget()
+        log_layout = QVBoxLayout(log_column)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(self._pane)
+        log_layout.addWidget(self._command_input)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._tag_panel)
-        splitter.addWidget(self._pane)
+        splitter.addWidget(log_column)
         splitter.setStretchFactor(1, 1)
         outer.addWidget(splitter)
 
@@ -306,6 +321,14 @@ class MainWindow(QMainWindow):
         link, self._link = self._link, None
         if link is not None:
             link.close()
+
+    def _on_command_entered(self, command: str) -> None:
+        if self._reader is None:
+            # The box is disabled outside a session; this only guards the
+            # instant between a session ending and the next status update.
+            self._report_error(f"Not connected; '{command}' not sent")
+            return
+        self._reader.send_command(command)
 
     def _on_reader_error(self, message: str) -> None:
         """A failure worth another attempt: tear down and go back to trying.
@@ -564,6 +587,9 @@ class MainWindow(QMainWindow):
         if self._last_error is not None:
             text = f"{text}   |   last error: {self._last_error}"
         self.statusBar().showMessage(text)
+        # Here because every state change ends in a status update, so the box
+        # cannot be left enabled for a session that has gone.
+        self._command_input.setEnabled(self._is_streaming)
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
